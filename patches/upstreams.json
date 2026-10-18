@@ -1,0 +1,12 @@
+{
+  "kwin": {
+    "url": "https://github.com/KDE/kwin.git",
+    "revision": "066d1e17c945d9a89fee645e10a2bbd77f2e93a6",
+    "patch": "kwin-live-renderer.patch"
+  },
+  "zss": {
+    "url": "https://github.com/z3r0n3br4instorm/ZrnSelectiveSuspend.git",
+    "revision": "82d80f3e44e6a8ed696e4fe3b17655e3952a58cd",
+    "patch": "zss-render-migration.patch"
+  }
+}

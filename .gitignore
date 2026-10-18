@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+node_modules/
+.hyperframes/
+build-src/
+hardware.json
+*.log
+reference/g513qy/indicator/frost-gpu-indicator
+brag-output/*.tmp.mp4
+.env
+.env.*
+.waveform-cache/

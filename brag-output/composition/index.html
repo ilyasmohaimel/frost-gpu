@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=1280, height=720">
+  <title>Frost GPU project tour</title>
+  <script src="node_modules/gsap/dist/gsap.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin:0; background:#142d45; color:#f0f6fa; font-family:system-ui,sans-serif; }
+    #root { width:100%; height:100%; position:relative; overflow:hidden; }
+    .clip { position:absolute; inset:0; }
+    .copy { position:absolute; left:64px; top:65px; width:890px; }
+    h1,h2,p { margin:0; }
+    h1,h2 { font-size:65px; line-height:1.1; letter-spacing:-2px; font-weight:700; }
+    .sub { font-size:27px; color:#c0d4e4; margin-top:22px; line-height:1.4; }
+    .power { position:absolute; top:64px; right:60px; border:2px solid #9bb8d0; padding:12px 19px; border-radius:28px; font-size:23px; color:#f0f6fa; }
+    .second { top:140px; }
+    .hardware { position:absolute; left:64px; top:305px; width:1152px; height:290px; }
+    .chip { position:absolute; top:12px; width:270px; height:210px; border:3px solid; border-radius:20px; padding:29px 25px; }
+    .chip:before,.chip:after { content:''; position:absolute; left:25px; right:25px; height:12px; background:repeating-linear-gradient(90deg,currentColor 0 4px,transparent 4px 27px); }
+    .chip:before { top:-15px; } .chip:after { bottom:-15px; }
+    .igpu { left:62px; color:#99c9ef; background:#213f5a; border-color:#99c9ef; }
+    .rx { right:62px; color:#e7a17e; background:#75402e; border-color:#e7a17e; }
+    .chip strong { display:block; color:#f0f6fa; font-size:40px; font-weight:600; }
+    .chip p { color:#f0f6fa; font-size:23px; margin-top:14px; }
+    .path { position:absolute; top:104px; left:332px; width:488px; height:4px; background:#9bb8d0; transform-origin:left; }
+    .token { position:absolute; left:835px; top:149px; width:240px; height:58px; background:#f0f6fa; color:#142d45; border-radius:12px; padding:12px 0; text-align:center; font-size:23px; font-weight:650; z-index:2; }
+    .token-label { position:absolute; top:258px; left:295px; font-size:24px; color:#c0d4e4; }
+    .fixed { position:absolute; left:62px; top:258px; font-size:23px; color:#99c9ef; }
+    .sleep { position:absolute; right:62px; top:258px; font-size:23px; color:#f0f6fa; }
+    .footer { position:absolute; left:64px; bottom:30px; font-size:21px; color:#c0d4e4; }
+    .brand { position:absolute; right:64px; bottom:30px; font-size:21px; color:#f0f6fa; }
+    .end { position:absolute; inset:0; background:#142d45; padding:105px 64px; }
+    .end h2 { font-size:103px; }
+    .end .sub { max-width:940px; font-size:35px; }
+    .url { margin-top:58px; font-size:30px; color:#99c9ef; }
+    .notes { margin-top:34px; font-size:24px; color:#c0d4e4; }
+  </style>
+</head>
+<body>
+<div data-hf-id="hf-xzb9" id="root" data-composition-id="frost-gpu" data-start="0" data-duration="22" data-width="1280" data-height="720">
+  <section data-hf-id="hf-vysm" id="scene-intro" class="clip" data-start="0" data-duration="4" data-track-index="1">
+    <div data-hf-id="hf-m2vh" class="copy" id="intro"><h1 data-hf-id="hf-ixfy">Keep the desktop.</h1><h1 data-hf-id="hf-n4fr">Change the GPU.</h1></div>
+    <div data-hf-id="hf-pupp" class="power">Barrel charger</div>
+  </section>
+  <section data-hf-id="hf-hbnn" id="scene-unplug" class="clip" data-start="4" data-duration="6" data-track-index="1">
+    <div data-hf-id="hf-7ako" class="copy" id="unplug"><h2 data-hf-id="hf-l406">Unplug.</h2><h2 data-hf-id="hf-q6z9">Keep working.</h2><p data-hf-id="hf-mewh" class="sub">Supported rendering moves to iGPU.</p></div>
+    <div data-hf-id="hf-t4ts" class="power">Battery</div>
+  </section>
+  <section data-hf-id="hf-zdji" id="scene-sync" class="clip" data-start="10" data-duration="6" data-track-index="1">
+    <div data-hf-id="hf-i8w4" class="copy" id="sync"><h2 data-hf-id="hf-1q6e">Sync on iGPU.</h2><h2 data-hf-id="hf-rqjl">RX asleep.</h2><p data-hf-id="hf-sfw5" class="sub">USB-C PD follows the same iGPU policy.</p></div>
+    <div data-hf-id="hf-m7cn" class="power">Battery / USB-C</div>
+  </section>
+  <div data-hf-id="hf-k0h0" class="hardware" id="hardware" data-start="0" data-duration="16" data-track-index="3">
+    <div data-hf-id="hf-ruyx" class="path" id="signal-path"></div>
+    <div data-hf-id="hf-tqbz" class="chip igpu"><strong data-hf-id="hf-rxht">iGPU</strong><p data-hf-id="hf-72wy">Panel + frame sync</p></div>
+    <div data-hf-id="hf-cup7" class="chip rx" id="rx-chip"><strong data-hf-id="hf-8am1">RX 6800M</strong><p data-hf-id="hf-v3sh">Performance GPU</p></div>
+    <div data-hf-id="hf-2mcp" class="token" id="app-token">App rendering</div>
+    <div data-hf-id="hf-z0pn" class="token-label">Supported wrapped apps</div>
+    <div data-hf-id="hf-uwag" class="sleep" id="sleep-status">suspended + D3cold</div>
+  </div>
+  <section data-hf-id="hf-eik3" id="scene-outro" class="clip" data-start="16" data-duration="6" data-track-index="2">
+    <div data-hf-id="hf-x976" class="end" id="outro"><h2 data-hf-id="hf-fezt">Frost GPU</h2><p data-hf-id="hf-2suq" class="sub">Source, patches, and a guide for your hardware.</p><p data-hf-id="hf-0nmj" class="url">github.com/ilyasmohaimel/frost-gpu</p><p data-hf-id="hf-d4ug" class="notes">KDE Wayland · Vega + RX 6800M</p></div>
+  </section>
+  <p data-hf-id="hf-yvyi" class="footer">Illustrated sequence · AMD/AMD tested · app support varies</p>
+  <p data-hf-id="hf-8rba" class="brand">Frost GPU</p>
+  <audio data-hf-id="hf-n0l6" id="soundtrack" src="assets/frost-tone.wav" data-start="0" data-duration="22" data-track-index="10" data-volume="0.85"></audio>
+</div>
+<script>
+  const tl = gsap.timeline({paused:true});
+  tl.fromTo('#intro', {opacity:0, x:-24}, {opacity:1, x:0, duration:.7, ease:'power3.out'}, .15);
+  tl.fromTo('#signal-path', {scaleX:0}, {scaleX:1, duration:.9, ease:'power2.inOut'}, .35);
+  tl.fromTo('#unplug', {opacity:0}, {opacity:1, duration:.45, ease:'power2.out'}, 4);
+  tl.to('#app-token', {x:-758, duration:1.6, ease:'power2.inOut'}, 5.6);
+  tl.fromTo('#sync', {opacity:0}, {opacity:1, duration:.45, ease:'power2.out'}, 10);
+  tl.to('#rx-chip', {backgroundColor:'#213f5a', borderColor:'#51728c', duration:.8, ease:'power2.out'}, 10.4);
+  tl.fromTo('#sleep-status', {opacity:0, y:8}, {opacity:1, y:0, duration:.6, ease:'power2.out'}, 10.8);
+  tl.fromTo('#outro', {opacity:0}, {opacity:1, duration:.7, ease:'power2.out'}, 16);
+  window.__timelines['frost-gpu'] = tl;
+</script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+[Unit]
+Description=Frost session render migration daemon
+ConditionEnvironment=FROST_GPU_LIVE_SESSION=1
+PartOf=graphical-session.target
+Before=plasma-plasmashell.service
+
+[Service]
+ExecCondition=/usr/local/libexec/frost-gpu-session check
+ExecStart=/opt/frost-gpu/bin/zssd --config /opt/frost-gpu/share/zssd.conf --socket %t/frost-gpu-live/render.sock --runtime-dir %t/frost-gpu-live --gpu 0000:03:00.0 --gpu 0000:07:00.0 --no-auto-attach
+RuntimeDirectory=frost-gpu-live
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+Restart=no
+TimeoutStopSec=10
+Slice=session.slice
+
+[Install]
+WantedBy=plasma-workspace.target

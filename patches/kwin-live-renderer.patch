@@ -1,0 +1,306 @@
+diff --git a/src/compositor.cpp b/src/compositor.cpp
+index 3727cd5..6f4e558 100644
+--- a/src/compositor.cpp
++++ b/src/compositor.cpp
+@@ -27,6 +27,7 @@
+ #include "effect/effecthandler.h"
+ #include "ftrace.h"
+ #include "opengl/eglbackend.h"
++#include "opengl/eglcontext.h"
+ #include "opengl/glplatform.h"
+ #include "renderloopdrivenqanimationdriver.h"
+ #include "scene/cursoritem.h"
+@@ -146,6 +147,96 @@ RenderDevice *Compositor::primaryDevice() const
+     return m_primaryDevice;
+ }
+ 
++bool Compositor::switchPrimaryDevice(const QString &devicePath)
++{
++    m_primaryDeviceSwitchError.clear();
++    const auto reject = [this](const QString &reason) {
++        m_primaryDeviceSwitchError = reason;
++        qCWarning(KWIN_CORE) << reason;
++        return false;
++    };
++    if (!environmentVariableBoolValue("KWIN_ENABLE_EXPERIMENTAL_GPU_SWITCH").value_or(false)) {
++        return reject(QStringLiteral("Experimental GPU switching was not enabled at startup"));
++    }
++    if (waylandServer()->isScreenLocked()) {
++        return reject(QStringLiteral("GPU switching is paused while the session is locked"));
++    }
++    if (m_state != State::On || kwinApp()->isTerminating()
++        || m_backend->compositingType() != OpenGLCompositing) {
++        return reject(QStringLiteral("Compositor is not in a state that permits GPU switching"));
++    }
++
++    struct stat info;
++    if (stat(devicePath.toLocal8Bit().constData(), &info) != 0 || !S_ISCHR(info.st_mode)) {
++        return reject(QStringLiteral("Target must be an existing DRM character device"));
++    }
++    RenderDevice *target = GpuManager::self()->compatibleRenderDevice(info.st_rdev);
++    if (!target || target->isSoftwareDevice() || target->isInReset()) {
++        return reject(QStringLiteral("Target is unavailable, software-rendered, or resetting"));
++    }
++    if (target == m_primaryDevice) {
++        return true;
++    }
++    if (!m_primaryDeviceSwitchBlockers.isEmpty()) {
++        return reject(QStringLiteral("GPU switching is blocked by an active screencast source"));
++    }
++
++    // Check the new context before touching the working compositor. Keep the
++    // check scoped so it does not retain a context after a failed request.
++    {
++        const auto previousContext = static_cast<EglBackend *>(m_backend.get())->openglContextRef();
++        const auto context = target->eglContext();
++        const bool ready = context && context->makeCurrent();
++        const bool restored = previousContext->makeCurrent();
++        if (!ready || !restored) {
++            return reject(QStringLiteral("Could not initialize the target GPU's EGL context"));
++        }
++    }
++
++    RenderDevice *previous = m_primaryDevice;
++    stop();
++    m_primaryDevice = target;
++    bool switched = false;
++#ifndef NDEBUG
++    // Only for isolated debug-build fault-injection tests of the rollback path.
++    if (qEnvironmentVariable("KWIN_TEST_GPU_SWITCH_REJECT_TARGET") != target->path())
++#endif
++    {
++        switched = attemptOpenGLCompositing();
++    }
++    if (!switched) {
++        // Do not call start() without a backend: its ordinary startup failure
++        // path quits KWin. A failed request must restore the previous renderer.
++        m_primaryDevice = previous;
++        if (!attemptOpenGLCompositing()) {
++            qCCritical(KWIN_CORE) << "GPU switch and rollback both failed; compositing remains stopped";
++            return reject(QStringLiteral("GPU switch and rollback failed; compositing remains stopped"));
++        }
++        m_primaryDeviceSwitchError = QStringLiteral("Target renderer failed; the previous GPU was restored");
++    }
++    start();
++    Q_EMIT primaryGpuChanged();
++    // Rebuild the entire output after replacing all renderer resources,
++    // including surfaces that have not submitted new damage.
++    kwinApp()->scene()->addRepaintFull();
++    qCInfo(KWIN_CORE) << "Primary renderer switched from" << previous->path()
++                     << "to" << m_primaryDevice->path();
++    return switched;
++}
++
++QString Compositor::primaryDeviceSwitchError() const
++{
++    return m_primaryDeviceSwitchError;
++}
++
++void Compositor::blockPrimaryDeviceSwitch(QObject *owner)
++{
++    m_primaryDeviceSwitchBlockers.insert(owner);
++    connect(owner, &QObject::destroyed, this, [this, owner]() {
++        m_primaryDeviceSwitchBlockers.remove(owner);
++    });
++}
++
+ static QVariantHash collectCrashInformation(const EglBackend *backend)
+ {
+     const GLPlatform *glPlatform = backend->openglContext()->glPlatform();
+diff --git a/src/compositor.h b/src/compositor.h
+index 5cbbb3c..3ac030e 100644
+--- a/src/compositor.h
++++ b/src/compositor.h
+@@ -16,6 +16,7 @@
+ 
+ #include <QHash>
+ #include <QObject>
++#include <QSet>
+ 
+ #include <memory>
+ 
+@@ -74,6 +75,12 @@ public:
+     RenderBackend *backend() const;
+     RenderDevice *primaryDevice() const;
+ 
++    // Experimental opt-in API. Changes KWin's renderer without replacing the
++    // Wayland server, its clients, or the output backend's scanout devices.
++    bool switchPrimaryDevice(const QString &devicePath);
++    QString primaryDeviceSwitchError() const;
++    void blockPrimaryDeviceSwitch(QObject *owner);
++
+     void createRenderer();
+ 
+ Q_SIGNALS:
+@@ -130,6 +137,8 @@ protected:
+     std::optional<bool> m_allowOverlaysEnv;
+     RenderLoopDrivenQAnimationDriver *m_renderLoopDrivenAnimationDriver;
+     RenderDevice *m_primaryDevice = nullptr;
++    QString m_primaryDeviceSwitchError;
++    QSet<QObject *> m_primaryDeviceSwitchBlockers;
+ };
+ 
+ } // namespace KWin
+diff --git a/src/dbusinterface.cpp b/src/dbusinterface.cpp
+index 6110ddf..928b9fc 100644
+--- a/src/dbusinterface.cpp
++++ b/src/dbusinterface.cpp
+@@ -16,7 +16,9 @@
+ // kwin
+ #include "compositor.h"
+ #include "core/output.h"
++#include "core/gpumanager.h"
+ #include "core/renderbackend.h"
++#include "core/renderdevice.h"
+ #include "debug_console.h"
+ #include "kwinadaptor.h"
+ #include "main.h"
+@@ -283,6 +285,33 @@ void CompositorDBusInterface::reinitialize()
+     m_compositor->reinitialize();
+ }
+ 
++QString CompositorDBusInterface::primaryGpu() const
++{
++    const auto device = m_compositor->primaryDevice();
++    return device ? device->path() : QString();
++}
++
++QStringList CompositorDBusInterface::renderDevices() const
++{
++    QStringList paths;
++    for (const auto &device : GpuManager::self()->renderDevices()) {
++        if (!device->isSoftwareDevice()) {
++            paths.push_back(device->path());
++        }
++    }
++    return paths;
++}
++
++bool CompositorDBusInterface::switchPrimaryGpu(const QString &devicePath)
++{
++    return m_compositor->switchPrimaryDevice(devicePath);
++}
++
++QString CompositorDBusInterface::gpuSwitchError() const
++{
++    return m_compositor->primaryDeviceSwitchError();
++}
++
+ QStringList CompositorDBusInterface::supportedOpenGLPlatformInterfaces() const
+ {
+     return {QStringLiteral("egl")};
+diff --git a/src/dbusinterface.h b/src/dbusinterface.h
+index ebabdef..f211c2f 100644
+--- a/src/dbusinterface.h
++++ b/src/dbusinterface.h
+@@ -146,6 +146,9 @@ class CompositorDBusInterface : public QObject
+     Q_PROPERTY(QStringList supportedOpenGLPlatformInterfaces READ supportedOpenGLPlatformInterfaces)
+ 
+     Q_PROPERTY(bool platformRequiresCompositing READ platformRequiresCompositing)
++    Q_PROPERTY(QString primaryGpu READ primaryGpu)
++    Q_PROPERTY(QStringList renderDevices READ renderDevices)
++    Q_PROPERTY(QString gpuSwitchError READ gpuSwitchError)
+ 
+ public:
+     explicit CompositorDBusInterface(Compositor *parent);
+@@ -158,6 +161,9 @@ public:
+     QString compositingType() const;
+     QStringList supportedOpenGLPlatformInterfaces() const;
+     bool platformRequiresCompositing() const;
++    QString primaryGpu() const;
++    QStringList renderDevices() const;
++    QString gpuSwitchError() const;
+ 
+ public Q_SLOTS:
+     /**
+@@ -166,6 +172,7 @@ public Q_SLOTS:
+      * On signal Compositor reloads settings and restarts.
+      */
+     void reinitialize();
++    bool switchPrimaryGpu(const QString &devicePath);
+ 
+ Q_SIGNALS:
+     void compositingToggled(bool active);
+diff --git a/src/org.kde.kwin.Compositing.xml b/src/org.kde.kwin.Compositing.xml
+index a1aef77..5bb17ee 100644
+--- a/src/org.kde.kwin.Compositing.xml
++++ b/src/org.kde.kwin.Compositing.xml
+@@ -8,9 +8,16 @@
+     <property name="compositingType" type="s" access="read"/>
+     <property name="supportedOpenGLPlatformInterfaces" type="as" access="read"/>
+     <property name="platformRequiresCompositing" type="b" access="read"/>
++    <property name="primaryGpu" type="s" access="read"/>
++    <property name="renderDevices" type="as" access="read"/>
++    <property name="gpuSwitchError" type="s" access="read"/>
+     <signal name="compositingToggled">
+       <arg name="active" type="b" direction="out"/>
+     </signal>
+     <method name="reinitialize"/>
++    <method name="switchPrimaryGpu">
++      <arg name="devicePath" type="s" direction="in"/>
++      <arg name="success" type="b" direction="out"/>
++    </method>
+   </interface>
+ </node>
+diff --git a/src/plugins/screencast/screencastsource.cpp b/src/plugins/screencast/screencastsource.cpp
+index f455408..2fd54d1 100644
+--- a/src/plugins/screencast/screencastsource.cpp
++++ b/src/plugins/screencast/screencastsource.cpp
+@@ -16,6 +16,9 @@ ScreenCastSource::ScreenCastSource()
+     : m_renderDevice(Compositor::self()->primaryDevice())
+     , m_eglContext(m_renderDevice->eglContext())
+ {
++    // These sources retain the renderer and its GL resources for their entire
++    // lifetime. Refuse experimental switches until the capture has ended.
++    Compositor::self()->blockPrimaryDeviceSwitch(this);
+ }
+ 
+ ScreenCastSource::~ScreenCastSource()
+diff --git a/src/wayland/linuxdmabufv1clientbuffer.cpp b/src/wayland/linuxdmabufv1clientbuffer.cpp
+index 1b0c88c..a4c0527 100644
+--- a/src/wayland/linuxdmabufv1clientbuffer.cpp
++++ b/src/wayland/linuxdmabufv1clientbuffer.cpp
+@@ -15,14 +15,18 @@
+ #include "core/drmdevice.h"
+ #include "core/gpumanager.h"
+ #include "core/renderbackend.h"
++#include "core/renderdevice.h"
+ #include "linuxdmabufv1clientbuffer_p.h"
+ #include "surface_p.h"
+ #include "utils/common.h"
++#include "utils/envvar.h"
++#include "wayland_server.h"
+ 
+ #include <cstdint>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <qtypes.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ 
+ namespace KWin
+@@ -41,7 +45,23 @@ void LinuxDmaBufV1ClientBufferIntegrationPrivate::zwp_linux_dmabuf_v1_bind_resou
+ {
+     auto it = mainDevices.find(resource->client());
+     if (it == mainDevices.end()) {
+-        it = mainDevices.emplace(resource->client(), currentMainDevice);
++        dev_t preferredDevice = currentMainDevice;
++        // Keep Xwayland's own compositor on a stable GPU while the desktop
++        // renderer changes. Its existing GL resources cannot follow a new
++        // default device; other clients retain the ordinary feedback policy.
++        if (environmentVariableBoolValue("KWIN_ENABLE_EXPERIMENTAL_GPU_SWITCH").value_or(false)
++            && ClientConnection::get(resource->client()) == waylandServer()->xWaylandConnection()) {
++            const auto path = qgetenv("KWIN_XWAYLAND_RENDER_DEVICE");
++            struct stat metadata;
++            if (!path.isEmpty() && stat(path.constData(), &metadata) == 0 && S_ISCHR(metadata.st_mode)) {
++                if (auto target = GpuManager::self()->compatibleRenderDevice(metadata.st_rdev);
++                    target && perDeviceFormats.contains(target->deviceId())) {
++                    preferredDevice = target->deviceId();
++                    qCInfo(KWIN_CORE) << "Xwayland render device pinned to" << target->path();
++                }
++            }
++        }
++        it = mainDevices.emplace(resource->client(), preferredDevice);
+         QObject::connect(ClientConnection::get(resource->client()), &ClientConnection::destroyed, q, [this, c = resource->client()]() {
+             mainDevices.remove(c);
+         });

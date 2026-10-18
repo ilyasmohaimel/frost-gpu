@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="600" viewBox="0 0 1280 600" role="img" aria-labelledby="title desc">
+<title id="title">Frost GPU</title><desc id="desc">Keep the desktop. Change the GPU. An experimental KDE Wayland setup with iGPU on battery and USB-C, RX 6800M on barrel power.</desc>
+<defs><pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M 32 0 L 0 0 0 32" fill="none" stroke="#243d56" stroke-width="1"/></pattern></defs>
+<rect width="1280" height="600" rx="20" fill="#142d45"/>
+<rect x="710" width="570" height="600" fill="url(#grid)"/>
+<g font-family="system-ui, sans-serif" fill="#f0f6fa">
+<text x="70" y="112" font-size="28" font-weight="500">Frost GPU</text>
+<text x="66" y="238" font-size="66" font-weight="700" letter-spacing="-2">Keep the desktop.</text>
+<text x="66" y="314" font-size="66" font-weight="700" letter-spacing="-2">Change the GPU.</text>
+<text x="70" y="382" font-size="23" fill="#c0d4e4">Live rendering moves for KDE Wayland.</text>
+<text x="70" y="416" font-size="23" fill="#c0d4e4">A real AMD/AMD experiment, source included.</text>
+<rect x="70" y="487" width="276" height="45" rx="22" fill="#284961"/>
+<text x="91" y="516" font-size="17" fill="#e1effa">Battery + USB-C · iGPU</text>
+<rect x="360" y="487" width="225" height="45" rx="22" fill="#75402e"/>
+<text x="381" y="516" font-size="17" fill="#fff0e3">Barrel power · RX</text>
+</g>
+<g fill="none" stroke-width="3" stroke-linecap="round">
+<path d="M850 226V172H1130V226M850 367V423H1130V367" stroke="#99c9ef"/>
+<path d="M914 297H1064" stroke="#e7a17e"/>
+<path d="M1044 281L1064 297L1044 313M934 281L914 297L934 313" stroke="#e7a17e"/>
+<rect x="784" y="227" width="130" height="140" rx="18" fill="#213f5a" stroke="#99c9ef"/>
+<rect x="1064" y="227" width="130" height="140" rx="18" fill="#75402e" stroke="#e7a17e"/>
+<path d="M804 215v12M804 367v12" stroke="#99c9ef"/><path d="M826 215v12M826 367v12" stroke="#99c9ef"/><path d="M848 215v12M848 367v12" stroke="#99c9ef"/><path d="M870 215v12M870 367v12" stroke="#99c9ef"/><path d="M892 215v12M892 367v12" stroke="#99c9ef"/><path d="M1084 215v12M1084 367v12" stroke="#e7a17e"/><path d="M1106 215v12M1106 367v12" stroke="#e7a17e"/><path d="M1128 215v12M1128 367v12" stroke="#e7a17e"/><path d="M1150 215v12M1150 367v12" stroke="#e7a17e"/><path d="M1172 215v12M1172 367v12" stroke="#e7a17e"/></g><g font-family="system-ui,sans-serif" text-anchor="middle" fill="#f0f6fa">
+<text x="849" y="308" font-size="27" font-weight="600">iGPU</text><text x="1129" y="308" font-size="27" font-weight="600">RX</text>
+<text x="991" y="152" font-size="18" fill="#c0d4e4">Same session</text>
+<text x="991" y="459" font-size="18" fill="#c0d4e4">Panel + sync stay on iGPU</text>
+</g></svg>

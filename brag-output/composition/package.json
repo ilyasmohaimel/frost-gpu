@@ -1,0 +1,19 @@
+{
+  "name": "frost-gpu-tour",
+  "version": "1.0.0",
+  "description": "Animated explanation of the Frost GPU experiment",
+  "scripts": {
+    "dev": "hyperframes preview",
+    "check": "hyperframes check",
+    "render": "hyperframes render --quality delivery --fps 30 --output ../brag.mp4"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "dependencies": {
+    "gsap": "3.15.0",
+    "hyperframes": "0.8.168"
+  },
+  "private": true,
+  "license": "GPL-2.0-only",
+  "author": "Ilyas Mohaimel"
+}

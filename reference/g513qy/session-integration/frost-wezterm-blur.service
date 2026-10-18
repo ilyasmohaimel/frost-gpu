@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore KDE blur for the WezTerm XWayland migration route
+ConditionEnvironment=FROST_GPU_LIVE_SESSION=1
+After=plasma-kwin_wayland.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/libexec/frost-wezterm-blur
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=plasma-workspace.target

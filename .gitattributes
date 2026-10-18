@@ -1,0 +1,12 @@
+* text=auto
+*.patch text eol=lf -whitespace
+*.sh text eol=lf
+*.mp4 binary
+*.png binary
+*.jpg binary
+*.wav binary
+*.gif binary
+
+# Keep upstream license texts verbatim.
+LICENSES/** -whitespace
+LICENSE -whitespace

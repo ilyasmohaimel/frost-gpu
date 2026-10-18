@@ -1,0 +1,13 @@
+[Unit]
+Description=Frost GPU mode tray indicator
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/frost-gpu native -- /usr/bin/env QT_QPA_PLATFORM=wayland QT_WIDGETS_RHI=0 %h/.local/libexec/frost-gpu-indicator
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

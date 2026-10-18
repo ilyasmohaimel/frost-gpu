@@ -1,0 +1,11 @@
+[Unit]
+Description=Frost GPU barrel and USB-C runtime power policy
+After=systemd-udevd.service
+ConditionPathExists=/sys/bus/pci/devices/0000:03:00.0/power/control
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/frost-gpu-power
+
+[Install]
+WantedBy=multi-user.target

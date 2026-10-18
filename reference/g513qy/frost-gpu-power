@@ -1,0 +1,15 @@
+#!/usr/bin/python3 -I
+"""RX stays awake only on barrel-only power; USB-C/battery permit runtime sleep."""
+from pathlib import Path
+import importlib.util
+import time
+spec=importlib.util.spec_from_file_location('frost_power',Path(__file__).with_name('frost_power.py'))
+power=importlib.util.module_from_spec(spec);spec.loader.exec_module(power)
+gpu=Path('/sys/bus/pci/devices/0000:03:00.0')
+assert (gpu/'vendor').read_text().strip()=='0x1002'and (gpu/'device').read_text().strip()=='0x73df'
+# Coalesce closely spaced firmware/UCSI events before deciding the policy.
+time.sleep(.25)
+source=power.power_source();mode='on'if source['useRX']else'auto'
+control=gpu/'power/control'
+if control.read_text().strip()!=mode:control.write_text(mode+'\n')
+print('RX runtime policy: '+mode+'; power source: '+source['source'])

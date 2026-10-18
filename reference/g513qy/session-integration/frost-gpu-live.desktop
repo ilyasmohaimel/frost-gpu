@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Plasma (Frost GPU switching)
+Comment=Experimental AC/battery renderer switching with stock Plasma recovery
+Exec=/usr/local/libexec/frost-gpu-session session
+TryExec=/usr/local/libexec/frost-gpu-session
+DesktopNames=KDE
+Type=Application

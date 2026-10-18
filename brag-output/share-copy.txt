@@ -1,0 +1,1 @@
+Frost GPU moves supported KDE rendering between iGPU and RX 6800M, then lets the RX sleep. The patches, app results, and porting guide are public, including the limits: https://github.com/ilyasmohaimel/frost-gpu

@@ -1,0 +1,16 @@
+[Unit]
+Description=Frost AC/battery renderer switching
+ConditionEnvironment=FROST_GPU_LIVE_SESSION=1
+After=plasma-kwin_wayland.service plasma-plasmashell.service frost-gpu-render.service
+Wants=frost-gpu-render.service
+PartOf=graphical-session.target
+
+[Service]
+ExecCondition=/usr/local/libexec/frost-gpu-session check
+ExecStart=/opt/frost-gpu/bin/frost-gpu-live watch --socket %t/frost-gpu-live/render.sock
+UMask=0077
+Restart=no
+Slice=session.slice
+
+[Install]
+WantedBy=plasma-workspace.target

@@ -1,0 +1,6 @@
+{
+  "name": "ASUS G513QY AMD reference",
+  "igpu": "0000:07:00.0",
+  "dgpu": "0000:03:00.0",
+  "barrel_supply": "ADP0"
+}

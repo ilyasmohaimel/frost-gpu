@@ -1,0 +1,1689 @@
+diff --git a/README.md b/README.md
+index 1fb4bd3..679b694 100644
+--- a/README.md
++++ b/README.md
+@@ -126,6 +126,42 @@ and why (MMIO shadowing and a DMA isolator of our own are not planned).
+ 
+ ---
+ 
++## Local AMD rendering-only extension (experimental)
++
++This working tree adds `zssctl move PCI --to PCI` and `zssctl restore PCI`.
++They rebuild registered application rendering contexts on another GPU and back,
++without detaching hardware, changing GPU power, freezing cgroups, or switching
++the display server. The source GPU stays `attached`; individual clients may say
++`migrated-away`. Unlike `detach`, presentation handles may remain open on the
++source GPU. **This does not establish that the source GPU can sleep or that the
++whole desktop has moved.**
++
++On the ASUS G513QY with RX 6800M and Cezanne iGPU:
++
++```sh
++zssctl move 0000:03:00.0 --to 0000:07:00.0
++zssctl restore 0000:03:00.0
++```
++
++Only programs started through this tree's `zss-run` can participate. Existing
++unwrapped programs remain unchanged. The commands share existing authorization
++and busy-operation checks. Unsupported registered contexts refuse before a move;
++a failed or parked move requests a best-effort return to origin and reports an
++error. Rendering restore does not thaw unrelated clients frozen by hardware
++operations. A failed restore is also an error, never a claimed successful move.
++
++The launcher additionally defaults recognized Chromium apps to X11/XWayland on
++a Wayland session, where native Wayland failed Skia initialization in testing.
++Explicit `--ozone-platform` arguments, `--plain`, or
++`ZSS_CHROMIUM_PLATFORM=wayland` preserve an explicit choice. This changes only
++that application, not KWin. See `tests/test_launcher.py` and `tests/test_move.py`.
++
++Local tests cover isolated rendering/UI probes, not complete account, VPN,
++recording, video decode, game, or document workflows. No automatic charger
++policy, kernel module, system-wide Vulkan replacement, or real application
++profile change is installed by this extension. KWin's running renderer is still
++a separate blocker for whole-desktop switching and dGPU power-down.
++
+ ## Project Structure
+ 
+ * [`SPEC.md`](SPEC.md) - Long-term architecture, multi-vendor design, and failure analysis. Not a description of what exists.
+@@ -421,3 +457,35 @@ Two things are not under that licence:
+ The hash in `src/common/zss_hash.c` is MurmurHash3 by Austin Appleby, which is
+ in the public domain.
+ 
++
++Local mapped-memory lifetime fix: real buffer/object destruction now holds the
++recursive object lock through driver release and unlinking. Queue submissions
++scan all mapped objects, including otherwise unrelated buffers; concurrent
++destruction could previously free or clear their mappings during a copy. The
++CPU-only `device-lifetime` fake-driver regression fails against the original
++source and passes with the fix.
++
++Unused Vulkan query pools are now recreated from their creation recipe, allowing
++Qt RHI applications that allocate timestamp pools without using them. Recording
++query commands or reading results still marks the device non-migratable; query
++state/results are not preserved. `tests/test_query_pool.py SOURCE TARGET` checks
++both the unused-pool round trip and refusal after recording a reset command,
++without submitting any GPU work. `zss-run` clears child PRIME/Mesa device filters
++so a session-wide preference cannot hide the destination GPU. Use `--on` or
++`ZSS_START_ON` to select the initial virtual GPU.
++
++Buffer views now retain their buffer dependency and creation chain, recreate real
++view handles, and retain/replay uniform and storage texel descriptors (including
++copies, templates and null entries). A view-usage override requires native
++maintenance5 on the target; unsupported target creation fails for rollback.
++Storage bindings are revisited at submitted draws, including reusable and
++secondary command buffers, rather than only when descriptors are updated. A
++bind-only submission does not mark its storage buffer GPU-written. Writable
++access remains conservatively whole-resource: arbitrary concurrent host/GPU
++access patterns are not claimed as fully coherent by this prototype.
++
++`meson test -C build buffer-view` uses fake driver callbacks with no GPU or
++daemon. `tests/test_texel_buffers.py SOURCE TARGET` explicitly runs six
++one-fragment submissions on two real GPUs, verifies byte-exact shader-written
++values through both moves, and reuses descriptors/templates, a mapped pointer
++and a command buffer. It never detaches hardware or changes power policy.
+diff --git a/src/daemon/zssd.c b/src/daemon/zssd.c
+index eea7cd1..9848901 100644
+--- a/src/daemon/zssd.c
++++ b/src/daemon/zssd.c
+@@ -45,7 +45,7 @@ struct client {
+     pid_t pid;
+     uid_t uid;
+     gid_t gid;
+-    bool registered, subscribed, frozen;
++    bool registered, subscribed, frozen, render_only;
+     char name[64];
+     struct gpu_view view[ZSSD_MAX_GPUS];
+ 
+@@ -273,8 +273,8 @@ static bool authorised(const struct client *c)
+ 
+ /* ---- replies ----------------------------------------------------------------------- */
+ 
+-static void send_result(struct client *c, bool ok, const char *error, const char *message,
+-                        const struct gpu *g)
++static void send_result_with_uncertainty(struct client *c, bool ok, const char *error, const char *message,
++                                        const struct gpu *g, bool uncertain)
+ {
+     struct zj_out o;
+ 
+@@ -282,6 +282,7 @@ static void send_result(struct client *c, bool ok, const char *error, const char
+         return;
+     zj_begin(&o, "result");
+     zj_add_bool(&o, "ok", ok);
++    zj_add_bool(&o, "uncertain", uncertain);
+     if (error && error[0])
+         zj_add_str(&o, "error", error);
+     zj_add_str(&o, "message", message ? message : "");
+@@ -293,6 +294,12 @@ static void send_result(struct client *c, bool ok, const char *error, const char
+     zss_send(c->fd, &o);
+ }
+ 
++static void send_result(struct client *c, bool ok, const char *error, const char *message,
++                        const struct gpu *g)
++{
++    send_result_with_uncertainty(c, ok, error, message, g, false);
++}
++
+ static void send_blocker(struct client *c, pid_t pid, const char *name, const char *kind,
+                          const char *reason)
+ {
+@@ -1067,6 +1074,133 @@ static void restore_clients(struct gpu *g, char *failed, size_t n, struct client
+     }
+ }
+ 
++/* Unlike hardware attach, rendering restore never thaws cgroups or contacts
++ * clients that have no context originating on this GPU. */
++static void render_restore(struct gpu *g, char *failed, size_t n, const pid_t *only)
++{
++    int gi = (int)(g - gpus);
++    pid_t asked[MAX_CLIENTS] = {0};
++
++    failed[0] = '\0';
++    for (int i = 0; i < MAX_CLIENTS; i++) {
++        struct client *c = &clients[i];
++
++        if (only && only[i] != c->pid)
++            continue;
++        if (c->fd >= 0 && c->registered && c->view[gi].origin > 0 && c->frozen) {
++            snprintf(failed, n, "application %d is frozen by a hardware operation", c->pid);
++            return;
++        }
++    }
++    for (int i = 0; i < MAX_CLIENTS; i++) {
++        struct client *c = &clients[i];
++        struct zj_out o;
++
++        if (c->fd < 0 || !c->registered || c->view[gi].origin <= 0 || (only && only[i] != c->pid))
++            continue;
++        asked[i] = c->pid;
++        zj_begin(&o, "restore");
++        zj_add_str(&o, "gpu", g->pci);
++        ask(c, &o);
++    }
++    wait_outcomes();
++    for (int i = 0; i < MAX_CLIENTS; i++)
++        if (asked[i] && (clients[i].fd < 0 || clients[i].pid != asked[i] || clients[i].outcome != OC_MIGRATED)) {
++            snprintf(failed, n, "application %d did not complete the rendering restore", asked[i]);
++            return;
++        }
++}
++
++/* Move tracked rendering contexts without releasing hardware. Display/presentation
++ * handles may legitimately remain on the source GPU. This operation must never
++ * call a backend, freeze a process, or advertise that a device can be removed. */
++static void do_move(struct client *req, struct gpu *g, const char *to, bool restore)
++{
++    int gi = (int)(g - gpus), moved = 0;
++    pid_t asked[MAX_CLIENTS] = {0};
++    pid_t origins[ZSSD_MAX_GPUS][MAX_CLIENTS] = {{0}};
++    char failed[400] = "", msg[512], path[300], klass[32];
++    struct gpu *target_gpu = gpu_find(to);
++    bool present_target;
++
++    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%.15s/class", to);
++    present_target = strlen(to) == 12 && read_text(path, klass, sizeof(klass)) == 0 &&
++                     (strtoul(klass, NULL, 16) >> 16) == 0x03;
++    if (target_gpu && (target_gpu->state != GS_ATTACHED || target_gpu->dry_detached || target_gpu->off))
++        present_target = false;
++    if (g->state != GS_ATTACHED || g->dry_detached || g->off) {
++        send_result(req, false, "", "render-only moves require an attached GPU", g);
++        return;
++    }
++    if (restore) {
++        render_restore(g, failed, sizeof(failed), NULL);
++        send_result(req, !failed[0], "", failed[0] ? failed :
++                    "rendering restored; GPU driver, power and display server were left unchanged", g);
++        return;
++    }
++    if (!to[0] || !strcmp(to, g->pci) ||
++        (!strcmp(to, "software") ? !allow_software : !present_target)) {
++        send_result(req, false, "", "name a different, present target GPU with --to (software requires --allow-software)", g);
++        return;
++    }
++    /* Refuse before touching any client if a known render context cannot move.
++     * Unregistered applications are outside this operation and remain alone. */
++    for (int i = 0; i < MAX_CLIENTS; i++) {
++        struct client *c = &clients[i];
++
++        if (c->fd >= 0 && c->registered && c->view[gi].devices > 0 && (!c->view[gi].migratable || c->frozen || !c->render_only)) {
++            send_result(req, false, "", "a registered rendering context is not migratable", g);
++            return;
++        }
++    }
++    for (int i = 0; i < MAX_CLIENTS; i++) {
++        struct client *c = &clients[i];
++        struct zj_out o;
++
++        c->outcome = OC_NONE;
++        if (c->fd < 0 || !c->registered || c->view[gi].devices <= 0)
++            continue;
++        asked[i] = c->pid;
++        for (int j = 0; j < ngpus; j++)
++            if (c->view[j].origin > 0)
++                origins[j][i] = c->pid;
++        zj_begin(&o, "migrate");
++        zj_add_str(&o, "from", g->pci);
++        zj_add_str(&o, "to", to);
++        zj_add_bool(&o, "render_only", true);
++        ask(c, &o);
++        moved++;
++    }
++    wait_outcomes();
++    for (int i = 0; i < MAX_CLIENTS; i++) {
++        struct client *c = &clients[i];
++
++        if (asked[i] && (c->fd < 0 || c->pid != asked[i] || c->outcome != OC_MIGRATED)) {
++            snprintf(failed, sizeof(failed), "application %d did not complete the rendering move", asked[i]);
++            break;
++        }
++    }
++    if (failed[0]) {
++        /* Best effort return to origin. Never freeze a parked application. */
++        char rollback[400] = "";
++
++        /* A context currently on g may have started on another GPU. Restore
++         * participating clients to their actual origins, not just to g. */
++        for (int j = 0; j < ngpus; j++) {
++            char error[400];
++            render_restore(&gpus[j], error, sizeof(error), origins[j]);
++            if (error[0] && !rollback[0])
++                snprintf(rollback, sizeof(rollback), "%s", error);
++        }
++        snprintf(msg, sizeof(msg), "%s; origin restore %s", failed,
++                 rollback[0] ? "also failed; inspect status" : "requested");
++        send_result_with_uncertainty(req, false, "", msg, g, rollback[0] != '\0');
++    } else {
++        snprintf(msg, sizeof(msg), "%d application(s) moved; GPU driver, power and display server were left unchanged", moved);
++        send_result(req, true, "", msg, g);
++    }
++}
++
+ static void do_attach(struct client *req, struct gpu *g, bool restore, const char *why)
+ {
+     char err[ZSSD_ERR] = "", failed[400] = "";
+@@ -1875,8 +2009,14 @@ static void do_resume(struct client *req, pid_t pid)
+ 
+ /* ---- status ------------------------------------------------------------------------ */
+ 
+-static void do_status(struct client *req, const char *only)
++static void do_status(struct client *req, const char *only, bool tracked_only)
+ {
++    if (tracked_only) {
++        struct zj_out capabilities;
++        zj_begin(&capabilities, "capabilities");
++        zj_add_int(&capabilities, "render_only_version", 1);
++        zss_send(req->fd, &capabilities);
++    }
+     for (int gi = 0; gi < ngpus; gi++) {
+         struct gpu *g = &gpus[gi];
+         pid_t holders[128];
+@@ -1926,7 +2066,8 @@ static void do_status(struct client *req, const char *only)
+                 zss_send(req->fd, &o);
+             }
+         }
+-        nh = find_holders(g, holders, 128);
++        /* The charger watcher needs context state, not a repeated /proc scan. */
++        nh = tracked_only ? 0 : find_holders(g, holders, 128);
+         for (int i = 0; i < nh; i++) {
+             char comm[64];
+ 
+@@ -1952,14 +2093,16 @@ static void do_status(struct client *req, const char *only)
+ 
+             if (c->fd < 0 || !c->registered)
+                 continue;
+-            if (!wants_migrate(c, gi, holders, nh) && v->origin == 0)
++            if (v->origin == 0 && (tracked_only ? v->devices <= 0 && v->parked <= 0 : !wants_migrate(c, gi, holders, nh)))
+                 continue;
+             zj_begin(&o, "client");
+             zj_add_str(&o, "gpu", g->pci);
+             zj_add_int(&o, "pid", c->pid);
+             zj_add_str(&o, "name", c->name);
+             zj_add_str(&o, "class", v->devices > 0 && !v->migratable ? "non-migratable" : "migratable");
+-            zj_add_str(&o, "reason", v->reason);
++            zj_add_bool(&o, "registered", true);
++            zj_add_int(&o, "render_only_version", c->render_only ? 1 : 0);
++            zj_add_str(&o, "reason", c->render_only ? v->reason : "relaunch this app with the current migration shim");
+             zj_add_int(&o, "devices", v->devices);
+             zj_add_int(&o, "parked", v->parked);
+             zj_add_bool(&o, "away", v->origin > v->devices);
+@@ -1985,6 +2128,7 @@ static void handle(struct client *c, struct zj_msg *m)
+         struct zj_out o;
+ 
+         c->registered = true;
++        c->render_only = zj_int(m, "render_only_version", 0) == 1;
+         snprintf(c->name, sizeof(c->name), "%s", zj_str(m, "name", "?"));
+         for (int i = 0; i < ZSSD_MAX_GPUS; i++)
+             c->view[i].migratable = true;
+@@ -2036,7 +2180,7 @@ static void handle(struct client *c, struct zj_msg *m)
+     } else if (zj_is(m, "subscribe")) {
+         c->subscribed = true;
+     } else if (zj_is(m, "status")) {
+-        do_status(c, zj_str(m, "gpu", ""));
++        do_status(c, zj_str(m, "gpu", ""), zj_bool(m, "tracked_only", false));
+     } else if (zj_is(m, "lend-check")) {
+         /* Read-only, like status. */
+         g = gpu_find(zj_str(m, "gpu", ""));
+@@ -2047,7 +2191,7 @@ static void handle(struct client *c, struct zj_msg *m)
+         else
+             do_lend_check(c, g, zj_bool(m, "with_group", false));
+     } else if (zj_is(m, "detach") || zj_is(m, "attach") || zj_is(m, "resume") || zj_is(m, "off") || zj_is(m, "on") ||
+-               zj_is(m, "lend") || zj_is(m, "reclaim")) {
++               zj_is(m, "lend") || zj_is(m, "reclaim") || zj_is(m, "move") || zj_is(m, "restore")) {
+         if (!authorised(c)) {
+             send_result(c, false, "", "permission denied", NULL);
+             return;
+@@ -2072,6 +2216,8 @@ static void handle(struct client *c, struct zj_msg *m)
+                 do_reclaim(c, g, zj_bool(m, "return", true));
+             } else if (g->state == GS_LENT) {
+                 send_result(c, false, "", "the device is lent to a virtual machine; take it back with: zssctl reclaim", g);
++            } else if (zj_is(m, "move") || zj_is(m, "restore")) {
++                do_move(c, g, zj_str(m, "to", ""), zj_is(m, "restore"));
+             } else if (zj_is(m, "detach")) {
+                 do_release(c, g, zj_str(m, "to", ""), false, false, false);
+             } else if (zj_is(m, "off")) {
+diff --git a/src/layer/cmd.c b/src/layer/cmd.c
+index 1b94ce4..95f34db 100644
+--- a/src/layer/cmd.c
++++ b/src/layer/cmd.c
+@@ -523,14 +523,56 @@ static void retain_buffer_copy(struct zss_obj *src, struct zss_obj *dst, const V
+     free(tmp);
+ }
+ 
++static void storage_set_dirty(struct zss_obj *set)
++{
++    if (!set || set->kind != ZK_DSET)
++        return;
++    for (uint32_t b = 0; b < set->u.dset.nslots; b++) {
++        const struct zss_slot *slot = &set->u.dset.slot[b];
++        for (uint32_t i = 0; i < slot->count; i++) {
++            const struct zss_slot_entry *e = &slot->e[i];
++            if (!e->written)
++                continue;
++            if ((slot->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || slot->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) && e->buffer)
++                buffer_dirty(e->buffer);
++            else if (slot->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER && e->buffer_view)
++                buffer_dirty(ZOBJ(e->buffer_view->u.buffer_view.ci.buffer));
++            else if (slot->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && e->view)
++                zss_image_dirty(ZOBJ(e->view->u.view.ci.image), true);
++        }
++    }
++}
++
+ /*
+  * Called once a submit has been accepted: the command buffer's effects on
+  * image layouts and on where contents come from are now real.
+  */
+ void zss_cmd_track_submit(struct zss_dev *dev, struct zss_obj *cb)
+ {
++    /* Matches the layer's existing 32-set binding/replay bound. Re-read the
++     * descriptor objects on every submission, including reusable recordings. */
++    struct zss_obj *bound[32] = {0};
+     for (const struct zss_cmd *c = cb->u.cb.head; c; c = c->next) {
+         switch (c->op) {
++        case OP_BIND_DSETS:
++            if (c->u[0] == VK_PIPELINE_BIND_POINT_GRAPHICS)
++                for (uint32_t i = 0; i < c->n[0] && c->u[1] + i < 32; i++)
++                    bound[c->u[1] + i] = ((struct zss_obj **)c->a[0])[i];
++            break;
++        case OP_DRAW:
++        case OP_DRAW_INDEXED:
++            if (!c->u[0] || !c->u[1])
++                break;
++            /* fall through */
++        case OP_DRAW_INDIRECT:
++        case OP_DRAW_INDEXED_INDIRECT:
++        case OP_DRAW_BYTE_COUNT:
++            /* Binding without drawing does not access a storage resource.
++             * Shader access ranges remain conservatively whole-resource, as
++             * elsewhere in this prototype's ownership tracking. */
++            for (uint32_t i = 0; i < 32; i++)
++                storage_set_dirty(bound[i]);
++            break;
+         case OP_BEGIN_RENDERING:
+             zss_cmd_track_rendering(c->a[0]);
+             break;
+@@ -543,6 +585,8 @@ void zss_cmd_track_submit(struct zss_dev *dev, struct zss_obj *cb)
+             for (uint32_t i = 0; i < c->n[0]; i++)
+                 if (subs[i] && subs[i] != cb)
+                     zss_cmd_track_submit_effects(dev, subs[i]);
++            /* A primary must re-establish state after executing secondaries. */
++            memset(bound, 0, sizeof(bound));
+             break;
+         }
+         case OP_BARRIER: {
+@@ -1175,6 +1219,7 @@ VKAPI_ATTR void VKAPI_CALL zss_CmdBeginQuery(VkCommandBuffer cmd, VkQueryPool po
+                                              VkQueryControlFlags flags)
+ {
+     CB(cmd);
++    zss_dev_untracked(dev, "query commands");
+     dev->fn.CmdBeginQuery(REAL_CB, ZREAL(VkQueryPool, pool), query, flags);
+     zss_leave();
+ }
+@@ -1182,6 +1227,7 @@ VKAPI_ATTR void VKAPI_CALL zss_CmdBeginQuery(VkCommandBuffer cmd, VkQueryPool po
+ VKAPI_ATTR void VKAPI_CALL zss_CmdEndQuery(VkCommandBuffer cmd, VkQueryPool pool, uint32_t query)
+ {
+     CB(cmd);
++    zss_dev_untracked(dev, "query commands");
+     dev->fn.CmdEndQuery(REAL_CB, ZREAL(VkQueryPool, pool), query);
+     zss_leave();
+ }
+@@ -1190,6 +1236,7 @@ VKAPI_ATTR void VKAPI_CALL zss_CmdResetQueryPool(VkCommandBuffer cmd, VkQueryPoo
+                                                  uint32_t first, uint32_t count)
+ {
+     CB(cmd);
++    zss_dev_untracked(dev, "query commands");
+     dev->fn.CmdResetQueryPool(REAL_CB, ZREAL(VkQueryPool, pool), first, count);
+     zss_leave();
+ }
+@@ -1198,6 +1245,7 @@ VKAPI_ATTR void VKAPI_CALL zss_CmdWriteTimestamp(VkCommandBuffer cmd, VkPipeline
+                                                  VkQueryPool pool, uint32_t query)
+ {
+     CB(cmd);
++    zss_dev_untracked(dev, "query commands");
+     dev->fn.CmdWriteTimestamp(REAL_CB, stage, ZREAL(VkQueryPool, pool), query);
+     zss_leave();
+ }
+@@ -1208,6 +1256,7 @@ VKAPI_ATTR void VKAPI_CALL zss_CmdCopyQueryPoolResults(VkCommandBuffer cmd, VkQu
+                                                        VkQueryResultFlags flags)
+ {
+     CB(cmd);
++    zss_dev_untracked(dev, "query commands");
+     dev->fn.CmdCopyQueryPoolResults(REAL_CB, ZREAL(VkQueryPool, pool), first, count,
+                                     ZREAL(VkBuffer, dst), offset, stride, flags);
+     zss_leave();
+@@ -1522,11 +1571,12 @@ VKAPI_ATTR void VKAPI_CALL zss_CmdDrawIndirectByteCountEXT(VkCommandBuffer cmd,
+     RUN(c);
+ }
+ 
+-/* Query pools are not carried across (see OPAQUE_CREATE in device.c), so these pass straight through like the plain ones. */
++/* Used query pools cannot migrate; refuse before forwarding indexed commands too. */
+ VKAPI_ATTR void VKAPI_CALL zss_CmdBeginQueryIndexedEXT(VkCommandBuffer cmd, VkQueryPool pool, uint32_t query,
+                                                        VkQueryControlFlags flags, uint32_t index)
+ {
+     CB(cmd);
++    zss_dev_untracked(dev, "query commands");
+     if (dev->fn.CmdBeginQueryIndexedEXT)
+         dev->fn.CmdBeginQueryIndexedEXT(REAL_CB, ZREAL(VkQueryPool, pool), query, flags, index);
+     zss_leave();
+@@ -1535,6 +1585,7 @@ VKAPI_ATTR void VKAPI_CALL zss_CmdBeginQueryIndexedEXT(VkCommandBuffer cmd, VkQu
+ VKAPI_ATTR void VKAPI_CALL zss_CmdEndQueryIndexedEXT(VkCommandBuffer cmd, VkQueryPool pool, uint32_t query, uint32_t index)
+ {
+     CB(cmd);
++    zss_dev_untracked(dev, "query commands");
+     if (dev->fn.CmdEndQueryIndexedEXT)
+         dev->fn.CmdEndQueryIndexedEXT(REAL_CB, ZREAL(VkQueryPool, pool), query, index);
+     zss_leave();
+diff --git a/src/layer/control.c b/src/layer/control.c
+index c7bc5d9..efe16e6 100644
+--- a/src/layer/control.c
++++ b/src/layer/control.c
+@@ -228,8 +228,9 @@ static void do_migrate(const struct zj_msg *m)
+             worst = ZO_PARKED;
+     }
+     if (worst != ZO_FAILED) {
+-        /* The GPU is going away: let go of it completely. */
+-        from->detached = true;
++        /* Render-only moves leave the GPU available as a later destination.
++         * Hardware detach still hides it until an explicit restore. */
++        from->detached = !zj_bool(m, "render_only", false);
+         zss_gpu_hold(from, false);
+         zss_driver_close(from->drv);
+     }
+@@ -500,6 +501,7 @@ void zss_control_start(void)
+     zj_begin(&o, "register");
+     zj_add_int(&o, "pid", getpid());
+     zj_add_str(&o, "name", name);
++    zj_add_int(&o, "render_only_version", 1);
+     send_msg(&o);
+ 
+     if (zss_recv(&reader, &m, 2000) == 1) {
+diff --git a/src/layer/device.c b/src/layer/device.c
+index 426c31c..6f479e7 100644
+--- a/src/layer/device.c
++++ b/src/layer/device.c
+@@ -56,6 +56,7 @@ static void slots_free(struct zss_obj *o)
+             zss_obj_unref(s->e[i].sampler);
+             zss_obj_unref(s->e[i].view);
+             zss_obj_unref(s->e[i].buffer);
++            zss_obj_unref(s->e[i].buffer_view);
+         }
+         free(s->e);
+     }
+@@ -142,9 +143,11 @@ void *zss_obj_dup(struct zss_obj *o, const void *src, size_t size)
+ 
+ void zss_obj_kill(struct zss_obj *o)
+ {
++    pthread_mutex_lock(&zss_lock);
+     o->dead = true;
+     o->r = (struct zss_real){ 0 };
+     zss_obj_unref(o);
++    pthread_mutex_unlock(&zss_lock);
+ }
+ 
+ void zss_dev_untracked(struct zss_dev *dev, const char *feature)
+@@ -929,6 +932,24 @@ static VkResult real_pipeline(struct zss_dev *dev, struct zss_obj *o)
+     return r;
+ }
+ 
++static VkResult real_buffer_view(struct zss_dev *dev, struct zss_obj *o)
++{
++    VkBufferViewCreateInfo ci = o->u.buffer_view.ci;
++    VkBufferView view;
++    VkResult r;
++
++    ci.buffer = ZREAL(VkBuffer, ci.buffer);
++    /* A usage override on a view has no legacy equivalent. Preserve its
++     * meaning, or fail this target creation and let migration roll back. */
++    for (const VkBaseInStructure *x = ci.pNext; x; x = x->pNext)
++        if (x->sType == VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO && !dev->native_maint5)
++            return VK_ERROR_FEATURE_NOT_PRESENT;
++    r = dev->fn.CreateBufferView(dev->real, &ci, NULL, &view);
++    if (r == VK_SUCCESS)
++        o->r.h = (uint64_t)(uintptr_t)view;
++    return r;
++}
++
+ VkResult zss_real_create(struct zss_dev *dev, struct zss_obj *o)
+ {
+     VkDevice d = dev->real;
+@@ -952,6 +973,11 @@ VkResult zss_real_create(struct zss_dev *dev, struct zss_obj *o)
+         r = dev->fn.CreateImageView(d, &ci, NULL, OUT(VkImageView));
+         break;
+     }
++    case ZK_BUFFERVIEW:
++        return real_buffer_view(dev, o);
++    case ZK_QUERYPOOL:
++        r = dev->fn.CreateQueryPool(d, &o->u.query.ci, NULL, OUT(VkQueryPool));
++        break;
+     case ZK_SAMPLER: {
+         VkSamplerCreateInfo ci = o->u.sampler.ci;
+         VkSamplerYcbcrConversionInfo conv;
+@@ -1138,8 +1164,8 @@ void zss_real_destroy(struct zss_dev *dev, enum zss_kind kind, struct zss_real *
+             dev->fn.DestroySwapchainKHR(d, H(VkSwapchainKHR), NULL);
+         break;
+     case ZK_OPAQUE_EVENT: if (h) dev->fn.DestroyEvent(d, H(VkEvent), NULL); break;
+-    case ZK_OPAQUE_QUERYPOOL: if (h) dev->fn.DestroyQueryPool(d, H(VkQueryPool), NULL); break;
+-    case ZK_OPAQUE_BUFFERVIEW: if (h) dev->fn.DestroyBufferView(d, H(VkBufferView), NULL); break;
++    case ZK_QUERYPOOL: if (h) dev->fn.DestroyQueryPool(d, H(VkQueryPool), NULL); break;
++    case ZK_BUFFERVIEW: if (h) dev->fn.DestroyBufferView(d, H(VkBufferView), NULL); break;
+     default: break; /* sets and command buffers go with their pools */
+     }
+ #undef H
+@@ -1181,10 +1207,15 @@ static VkResult finish_create(struct zss_dev *dev, struct zss_obj *o, uint64_t *
+ 
+ static void destroy_obj(struct zss_dev *dev, struct zss_obj *o)
+ {
++    // A submit scans all mapped objects, including buffers not used by that
++    // submission. Their destruction on another valid Vulkan thread must not
++    // release a real mapping while that scan copies into it.
++    pthread_mutex_lock(&zss_lock);
+     struct zss_real r = o->r;
+ 
+     zss_real_destroy(dev, o->kind, &r);
+     zss_obj_kill(o);
++    pthread_mutex_unlock(&zss_lock);
+ }
+ 
+ #define DESTROY_FN(Name, T) \
+@@ -1656,14 +1687,17 @@ VKAPI_ATTR VkResult VKAPI_CALL zss_FreeDescriptorSets(VkDevice device, VkDescrip
+ }
+ 
+ static void entry_set(struct zss_slot_entry *e, struct zss_obj *sampler, struct zss_obj *view,
+-                      struct zss_obj *buffer)
++                      struct zss_obj *buffer, struct zss_obj *buffer_view)
+ {
++    zss_obj_ref(buffer_view);
+     zss_obj_ref(sampler);
+     zss_obj_ref(view);
+     zss_obj_ref(buffer);
+     zss_obj_unref(e->sampler);
+     zss_obj_unref(e->view);
+     zss_obj_unref(e->buffer);
++    zss_obj_unref(e->buffer_view);
++    e->buffer_view = buffer_view;
+     e->sampler = sampler;
+     e->view = view;
+     e->buffer = buffer;
+@@ -1690,6 +1724,7 @@ void zss_dset_apply(struct zss_dev *dev, struct zss_obj *set)
+     VkWriteDescriptorSet *w;
+     VkDescriptorImageInfo *ii;
+     VkDescriptorBufferInfo *bi;
++    VkBufferView *bv;
+ 
+     if (!real)
+         return;
+@@ -1698,6 +1733,7 @@ void zss_dset_apply(struct zss_dev *dev, struct zss_obj *set)
+     w = calloc(total + 1, sizeof(*w));
+     ii = calloc(total + 1, sizeof(*ii));
+     bi = calloc(total + 1, sizeof(*bi));
++    bv = calloc(total + 1, sizeof(*bv));
+ 
+     for (uint32_t b = 0; b < set->u.dset.nslots; b++) {
+         const struct zss_slot *s = &set->u.dset.slot[b];
+@@ -1706,7 +1742,7 @@ void zss_dset_apply(struct zss_dev *dev, struct zss_obj *set)
+             const struct zss_slot_entry *e = &s->e[i];
+ 
+             if (!e->written || (e->sampler && !e->sampler->r.h) || (e->view && !e->view->r.h) ||
+-                (e->buffer && !e->buffer->r.h))
++                (e->buffer && !e->buffer->r.h) || (e->buffer_view && !e->buffer_view->r.h))
+                 continue;
+             w[n] = (VkWriteDescriptorSet){
+                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+@@ -1716,7 +1752,10 @@ void zss_dset_apply(struct zss_dev *dev, struct zss_obj *set)
+                 .descriptorCount = 1,
+                 .descriptorType = s->type,
+             };
+-            if (e->buffer) {
++            if (s->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || s->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
++                bv[n] = e->buffer_view ? (VkBufferView)(uintptr_t)e->buffer_view->r.h : VK_NULL_HANDLE;
++                w[n].pTexelBufferView = &bv[n];
++            } else if (e->buffer) {
+                 bi[n] = (VkDescriptorBufferInfo){ (VkBuffer)(uintptr_t)e->buffer->r.h, e->offset, e->range };
+                 w[n].pBufferInfo = &bi[n];
+             } else if (e->sampler || e->view) {
+@@ -1746,6 +1785,7 @@ void zss_dset_apply(struct zss_dev *dev, struct zss_obj *set)
+     free(w);
+     free(ii);
+     free(bi);
++    free(bv);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL zss_UpdateDescriptorSets(VkDevice device, uint32_t nw,
+@@ -1766,10 +1806,10 @@ VKAPI_ATTR void VKAPI_CALL zss_UpdateDescriptorSets(VkDevice device, uint32_t nw
+                 break;
+             switch (w->descriptorType) {
+             case VK_DESCRIPTOR_TYPE_SAMPLER:
+-                entry_set(e, ZOBJ(w->pImageInfo[j].sampler), NULL, NULL);
++                entry_set(e, ZOBJ(w->pImageInfo[j].sampler), NULL, NULL, NULL);
+                 break;
+             case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+-                entry_set(e, ZOBJ(w->pImageInfo[j].sampler), ZOBJ(w->pImageInfo[j].imageView), NULL);
++                entry_set(e, ZOBJ(w->pImageInfo[j].sampler), ZOBJ(w->pImageInfo[j].imageView), NULL, NULL);
+                 e->layout = w->pImageInfo[j].imageLayout;
+                 break;
+             case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+@@ -1779,35 +1819,26 @@ VKAPI_ATTR void VKAPI_CALL zss_UpdateDescriptorSets(VkDevice device, uint32_t nw
+                 /* fall through */
+             case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+             case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+-                entry_set(e, NULL, ZOBJ(w->pImageInfo[j].imageView), NULL);
++                entry_set(e, NULL, ZOBJ(w->pImageInfo[j].imageView), NULL, NULL);
+                 e->layout = w->pImageInfo[j].imageLayout;
+                 break;
+             case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+             case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+             case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+             case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+-                entry_set(e, NULL, NULL, ZOBJ(w->pBufferInfo[j].buffer));
++                entry_set(e, NULL, NULL, ZOBJ(w->pBufferInfo[j].buffer), NULL);
+                 e->offset = w->pBufferInfo[j].offset;
+                 e->range = w->pBufferInfo[j].range;
+                 break;
++            case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
++            case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
++                entry_set(e, NULL, NULL, NULL, ZOBJ(w->pTexelBufferView[j]));
++                break;
+             default:
+-                zss_dev_untracked(dev, "texel buffer descriptors");
++                zss_dev_untracked(dev, "unsupported descriptor type");
+                 break;
+             }
+         }
+-        if (w->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+-            w->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
+-            /* Not tracked: hand the write straight to the driver. */
+-            VkWriteDescriptorSet real = *w;
+-            VkBufferView *views = malloc(w->descriptorCount * sizeof(*views));
+-
+-            for (uint32_t j = 0; j < w->descriptorCount; j++)
+-                views[j] = ZREAL(VkBufferView, w->pTexelBufferView[j]);
+-            real.dstSet = ZREAL(VkDescriptorSet, w->dstSet);
+-            real.pTexelBufferView = views;
+-            dev->fn.UpdateDescriptorSets(dev->real, 1, &real, 0, NULL);
+-            free(views);
+-        }
+     }
+     for (uint32_t i = 0; i < nc; i++) {
+         const VkCopyDescriptorSet *c = &copies[i];
+@@ -1820,7 +1851,7 @@ VKAPI_ATTR void VKAPI_CALL zss_UpdateDescriptorSets(VkDevice device, uint32_t nw
+ 
+             if (!s || !d)
+                 break;
+-            entry_set(d, s->sampler, s->view, s->buffer);
++            entry_set(d, s->sampler, s->view, s->buffer, s->buffer_view);
+             d->layout = s->layout;
+             d->offset = s->offset;
+             d->range = s->range;
+@@ -2670,11 +2701,46 @@ VKAPI_ATTR VkResult VKAPI_CALL zss_QueueBindSparse(VkQueue queue, uint32_t n,
+ 
+ #define OPAQUE_FIX(c) (void)(c)
+ OPAQUE_CREATE(Event, VkEvent, VkEventCreateInfo, ZK_OPAQUE_EVENT, "events")
+-OPAQUE_CREATE(QueryPool, VkQueryPool, VkQueryPoolCreateInfo, ZK_OPAQUE_QUERYPOOL, "query pools")
+-#undef OPAQUE_FIX
+-#define OPAQUE_FIX(c) (c).buffer = ZREAL(VkBuffer, (c).buffer)
+-OPAQUE_CREATE(BufferView, VkBufferView, VkBufferViewCreateInfo, ZK_OPAQUE_BUFFERVIEW, "buffer views")
++/* Qt RHI allocates a timestamp pool even when profiling is disabled.
++ * An unused pool has only a creation recipe. Commands and result reads still
++ * refuse migration because query state/results cannot be carried across. */
++VKAPI_ATTR VkResult VKAPI_CALL zss_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *ci,
++                                                 const VkAllocationCallbacks *alloc, VkQueryPool *out)
++{
++    ENTER(device);
++    struct zss_obj *o = zss_obj_new(dev, ZK_QUERYPOOL);
++
++    (void)alloc;
++    o->u.query.ci = *ci;
++    o->u.query.ci.pNext = zss_chain_keep(o, ci->pNext);
++    return finish_create(dev, o, (uint64_t *)out);
++}
+ #undef OPAQUE_FIX
++static struct zss_obj *keep_buffer_view(struct zss_dev *dev, const VkBufferViewCreateInfo *ci)
++{
++    struct zss_obj *o = zss_obj_new(dev, ZK_BUFFERVIEW);
++    if (!o)
++        return NULL;
++    o->u.buffer_view.ci = *ci;
++    o->u.buffer_view.ci.pNext = zss_chain_keep(o, ci->pNext);
++    zss_obj_dep(o, ZOBJ(ci->buffer));
++    return o;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL zss_CreateBufferView(VkDevice device, const VkBufferViewCreateInfo *ci,
++                                                   const VkAllocationCallbacks *alloc, VkBufferView *out)
++{
++    ENTER(device);
++    struct zss_obj *o = keep_buffer_view(dev, ci);
++
++    (void)alloc;
++    if (!o) {
++        *out = VK_NULL_HANDLE;
++        zss_leave();
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
++    }
++    return finish_create(dev, o, (uint64_t *)out);
++}
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL zss_GetEventStatus(VkDevice device, VkEvent event)
+ {
+@@ -2709,6 +2775,7 @@ VKAPI_ATTR VkResult VKAPI_CALL zss_GetQueryPoolResults(VkDevice device, VkQueryP
+                                                        VkQueryResultFlags flags)
+ {
+     ENTER(device);
++    zss_dev_untracked(dev, "query pool result reads");
+     VkResult r = dev->fn.GetQueryPoolResults(dev->real, ZREAL(VkQueryPool, pool), first, count, size,
+                                              data, stride, flags);
+ 
+diff --git a/src/layer/zss-run.in b/src/layer/zss-run.in
+index 5c8b791..c9d10dc 100755
+--- a/src/layer/zss-run.in
++++ b/src/layer/zss-run.in
+@@ -125,6 +125,23 @@ if [ -z "$plain" ] && prog="$(command -v "$1" 2>/dev/null)" && chromium_based "$
+     [ -z "$angle" ] || set -- "$@" --use-angle=vulkan
+     [ -z "$feature" ] || set -- "$@" --enable-features=Vulkan
+     note="; it is built on Chromium, so it is told to draw through Vulkan"
++
++    # Chromium's native Wayland Vulkan path failed Skia context creation in
++    # migration testing. Use the tested X11 presentation path on a Wayland
++    # desktop until that path is supported; this does not change the compositor.
++    # An explicit application choice or --plain always takes precedence.
++    platform="${ZSS_CHROMIUM_PLATFORM:-}"
++    if [ -z "$platform" ] && { [ "${XDG_SESSION_TYPE:-}" = wayland ] || [ -n "${WAYLAND_DISPLAY:-}" ]; }; then
++        platform=x11
++    fi
++    for a in "$@"; do
++        case "$a" in --ozone-platform|--ozone-platform=*) platform=""; break ;; esac
++    done
++    case "$platform" in
++    "") ;;
++    x11|wayland) set -- "$@" "--ozone-platform=$platform" ;;
++    *) echo "zss-run: ZSS_CHROMIUM_PLATFORM must be x11 or wayland" >&2; exit 2 ;;
++    esac
+ fi
+ 
+ if [ -n "$print" ]; then
+@@ -133,6 +150,11 @@ if [ -n "$print" ]; then
+ fi
+ [ -n "$ZSS_QUIET" ] || echo "zss-run: starting $(basename "$1") on $where (GPUs only for now)$note" >&2
+ 
++# A session-wide PRIME filter can hide the destination GPU from the real
++# driver. The virtual driver owns GPU selection through --on/ZSS_START_ON.
++# Apply this only to the launched child, leaving the desktop environment alone.
++unset DRI_PRIME MESA_VK_DEVICE_SELECT MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE
++
+ if [ -n "$gl" ]; then
+     # Zink in place of the GPU's own OpenGL, for GLX and EGL alike. LIBGL_KOPPER_DRI2: Zink's
+     # GLX otherwise insists on DRI3, which not every X screen offers.
+diff --git a/src/layer/zss_layer.h b/src/layer/zss_layer.h
+index a8e2d8d..e6eccdd 100644
+--- a/src/layer/zss_layer.h
++++ b/src/layer/zss_layer.h
+@@ -157,9 +157,9 @@ struct zss_gpu {
+ enum zss_kind {
+     ZK_MEMORY, ZK_BUFFER, ZK_IMAGE, ZK_VIEW, ZK_SAMPLER, ZK_SHADER, ZK_RENDERPASS,
+     ZK_FRAMEBUFFER, ZK_DSL, ZK_DPOOL, ZK_DSET, ZK_PLAYOUT, ZK_PCACHE, ZK_PIPELINE,
+-    ZK_CPOOL, ZK_CMDBUF, ZK_FENCE, ZK_SEMAPHORE, ZK_SWAPCHAIN, ZK_YCBCR,
++    ZK_CPOOL, ZK_CMDBUF, ZK_FENCE, ZK_SEMAPHORE, ZK_SWAPCHAIN, ZK_YCBCR, ZK_QUERYPOOL, ZK_BUFFERVIEW,
+     /* Forwarded without tracking; using one makes the device non-migratable. */
+-    ZK_OPAQUE_EVENT, ZK_OPAQUE_QUERYPOOL, ZK_OPAQUE_BUFFERVIEW, ZK_OPAQUE_PIPELINE,
++    ZK_OPAQUE_EVENT, ZK_OPAQUE_PIPELINE,
+     ZK_COUNT
+ };
+ 
+@@ -185,7 +185,7 @@ struct zss_slot {
+     VkDescriptorType type;
+     uint32_t count;
+     struct zss_slot_entry {
+-        struct zss_obj *sampler, *view, *buffer;
++        struct zss_obj *sampler, *view, *buffer, *buffer_view;
+         VkImageLayout layout;
+         VkDeviceSize offset, range;
+         bool written;
+@@ -247,7 +247,9 @@ struct zss_obj {
+             bool unretained; /* received an upload that could not be retained */
+         } img;
+         struct { VkImageViewCreateInfo ci; } view;
++        struct { VkBufferViewCreateInfo ci; } buffer_view;
+         struct { VkSamplerCreateInfo ci; } sampler;
++        struct { VkQueryPoolCreateInfo ci; } query;
+         struct { VkSamplerYcbcrConversionCreateInfo ci; } ycbcr;
+         struct { VkShaderModuleCreateInfo ci; } shader;
+         struct { VkRenderPassCreateInfo ci; } rp;
+diff --git a/src/zssctl/zssctl.c b/src/zssctl/zssctl.c
+index 5b0e67a..b8dd73e 100644
+--- a/src/zssctl/zssctl.c
++++ b/src/zssctl/zssctl.c
+@@ -12,6 +12,8 @@ static int usage(void)
+     fputs("usage: zssctl status [PCI]\n"
+           "       zssctl detach PCI [--to PCI|software]\n"
+           "       zssctl attach PCI\n"
++          "       zssctl move PCI --to PCI|software   move rendering only, leave hardware and display alone\n"
++          "       zssctl restore PCI                return rendering to its original GPU\n"
+           "       zssctl off PCI [--to PCI|software] [--console]\n"
+           "       zssctl on PCI [--stay]\n"
+           "       zssctl lend PCI [--with-group] [--to PCI|software]   hand the card to a virtual machine\n"
+@@ -220,6 +222,18 @@ int main(int argc, char **argv)
+         zss_send(fd, &o);
+         return show_status(&rd);
+     }
++    if (!strcmp(argv[1], "move") || !strcmp(argv[1], "restore")) {
++        bool restore = !strcmp(argv[1], "restore");
++
++        if ((restore && argc != 3) || (!restore && (argc != 5 || strcmp(argv[3], "--to"))))
++            return usage();
++        zj_begin(&o, restore ? "restore" : "move");
++        zj_add_str(&o, "gpu", argv[2]);
++        if (!restore)
++            zj_add_str(&o, "to", argv[4]);
++        zss_send(fd, &o);
++        return show_result(&rd);
++    }
+     if (!strcmp(argv[1], "detach") && argc >= 3) {
+         zj_begin(&o, "detach");
+         zj_add_str(&o, "gpu", argv[2]);
+diff --git a/tests/meson.build b/tests/meson.build
+index dbda5f4..075727f 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -36,6 +36,8 @@ endif
+ env = environment()
+ env.set('ZSS_BUILD', meson.project_build_root())
+ test('protocol', python, args: [files('test_protocol.py')], env: env, timeout: 60)
++test('move', python, args: [files('test_move.py')], env: env, timeout: 45)
++test('launcher', python, args: [files('test_launcher.py')], timeout: 30)
+ test('track-a', python, args: [files('track_a.py')], env: env, timeout: 900, is_parallel: false, depends: gl_apps)
+ test_rules = executable('test_rules', 'test_rules.c', '../src/daemon/power.c', '../src/daemon/sysfs.c',
+   include_directories: include_directories('../src/daemon'), dependencies: [common_dep])
+@@ -50,3 +52,29 @@ test('track-b', python, args: [files('track_b.py')], env: env, timeout: 600, is_
+ test('track-k', python, args: [files('track_k.py')], env: env, timeout: 600, is_parallel: false)
+ # Lending a card to a virtual machine, in the same guest with an emulated IOMMU.
+ test('track-v', python, args: [files('track_v.py')], env: env, timeout: 600, is_parallel: false)
++
++# Link only the actual lifetime paths used by this fake-driver regression.
++test_lifetime = executable('test_device_lifetime', 'test_device_lifetime.c',
++  dependencies: [common_dep, vulkan_headers, wsi_headers, threads],
++  c_args: ['-ffunction-sections', '-fdata-sections'], link_args: ['-Wl,--gc-sections'])
++test('device-lifetime', test_lifetime)
++
++# Bounded hardware integration helper: creates/records, never submits GPU work.
++query_probe = executable('zss-query-probe', 'testapp/zss-query-probe.c',
++  dependencies: [vulkan_headers, vulkan_loader])
++
++# Actual buffer-view recipe, descriptor, chain and submission bookkeeping;
++# driver calls are fakes, and no device, socket or hardware is opened.
++test_buffer_view = executable('test_buffer_view', 'test_buffer_view.c', '../src/layer/vk11.c', '../src/layer/format.c', '../src/layer/migrate.c', layer_tables,
++  include_directories: include_directories('../src/layer', '../tools'),
++  dependencies: [common_dep, vulkan_headers, wsi_headers, threads],
++  c_args: ['-ffunction-sections', '-fdata-sections'], link_args: ['-Wl,--gc-sections'])
++test('buffer-view', test_buffer_view)
++
++texel_headers=[]
++foreach stage : ['vert','frag']
++  texel_headers += custom_target('texel_'+stage, input:'testapp/texel.'+stage,
++    output:'texel_'+stage+'.h', command:[glslang,'-V','--quiet','--vn','texel_'+stage+'_spv','-o','@OUTPUT@','@INPUT@'])
++endforeach
++texel_probe=executable('zss-texel-probe','testapp/zss-texel-probe.c',texel_headers,
++  dependencies:[vulkan_headers,vulkan_loader])
+diff --git a/tests/test_buffer_view.c b/tests/test_buffer_view.c
+new file mode 100644
+index 0000000..76236f4
+--- /dev/null
++++ b/tests/test_buffer_view.c
+@@ -0,0 +1,141 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Actual metadata/descriptor/submit paths, with CPU-only driver callbacks. */
++#include "../src/layer/device.c"
++#define dup command_dup
++#include "../src/layer/cmd.c"
++#undef dup
++#include <assert.h>
++#include <stdarg.h>
++
++pthread_mutex_t zss_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
++static uint32_t updates, views_created, views_destroyed;
++static VkBuffer expected_buffer;
++static VkBufferView expected_view;
++static VkResult view_result = VK_SUCCESS;
++void zss_enter(void) {}
++void zss_leave(void) {}
++void zss_dbg(const char *fmt, ...) {}
++void zss_control_state_changed(void) {}
++void zss_retain_release(struct zss_ret *ret) { ret->valid=false; }
++bool zss_retain_get(const struct zss_ret *ret, void *dst) { return false; }
++bool zss_retain_put(const void *data, size_t size, struct zss_ret *ret) { ret->valid=true; return true; }
++void zss_shadow_free(uint8_t *p, VkDeviceSize size, bool watched) { free(p); }
++void zss_presenter_destroy(struct zss_presenter *p, bool gone) {}
++void zss_lower_forget_view(struct zss_dev *dev, VkImageView view) {}
++
++static VkResult VKAPI_CALL make_view(VkDevice d, const VkBufferViewCreateInfo *ci, const VkAllocationCallbacks *a, VkBufferView *out)
++{
++    assert(ci->buffer==expected_buffer);
++    assert(ci->format==VK_FORMAT_R32_UINT && ci->offset==16 && ci->range==64);
++    if (ci->pNext) {
++        const VkBufferUsageFlags2CreateInfo *usage=ci->pNext;
++        assert(usage->usage==VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT);
++    }
++    if (view_result!=VK_SUCCESS) return view_result;
++    *out=(VkBufferView)(uintptr_t)(100+(++views_created));
++    return VK_SUCCESS;
++}
++static void VKAPI_CALL destroy_view(VkDevice d, VkBufferView v, const VkAllocationCallbacks *a) { views_destroyed++; }
++static void VKAPI_CALL update(VkDevice d, uint32_t n, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c)
++{
++    assert(n==2 && !nc);
++    for(uint32_t i=0;i<n;i++) {
++        assert(w[i].pTexelBufferView && !w[i].pImageInfo && !w[i].pBufferInfo);
++        assert(w[i].pTexelBufferView[0]==expected_view);
++    }
++    updates++;
++}
++static struct zss_obj *make_set(struct zss_dev *dev, VkDescriptorType type)
++{
++    struct zss_obj *set=zss_obj_new(dev,ZK_DSET);
++    set->r.h=7;set->u.dset.nslots=2;
++    set->u.dset.slot=calloc(2,sizeof(struct zss_slot));
++    /* Two nonempty bindings: a two-element write rolls between them. */
++    for(uint32_t b=0;b<2;b++) {
++        set->u.dset.slot[b].type=type;set->u.dset.slot[b].count=1;
++        set->u.dset.slot[b].e=calloc(1,sizeof(struct zss_slot_entry));
++    }
++    return set;
++}
++int main(void)
++{
++    struct zss_dev dev={.real=(VkDevice)(uintptr_t)1,.native_maint5=true};
++    dev.fn.CreateBufferView=make_view;dev.fn.DestroyBufferView=destroy_view;dev.fn.UpdateDescriptorSets=update;
++    struct zss_obj *buf=zss_obj_new(&dev,ZK_BUFFER);buf->r.h=33;
++    VkBufferUsageFlags2CreateInfo usage={.sType=VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO,.usage=VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT};
++    VkBufferViewCreateInfo ci={.sType=VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,.pNext=&usage,.buffer=ZHANDLE(VkBuffer,buf),.format=VK_FORMAT_R32_UINT,.offset=16,.range=64};
++    struct zss_obj *view=keep_buffer_view(&dev,&ci);
++    assert(view && view->kind==ZK_BUFFERVIEW && buf->refs==2);
++    usage.usage=0;ci.offset=0;
++    expected_buffer=(VkBuffer)(uintptr_t)33;
++    assert(real_buffer_view(&dev,view)==VK_SUCCESS);
++    assert(view->u.buffer_view.ci.pNext!=&usage && view->u.buffer_view.ci.offset==16);
++    struct zss_obj *set=make_set(&dev,VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER);
++    VkBufferView virtual_views[2]={ZHANDLE(VkBufferView,view),ZHANDLE(VkBufferView,view)};
++    VkWriteDescriptorSet write={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=ZHANDLE(VkDescriptorSet,set),.dstBinding=0,.descriptorCount=2,.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,.pTexelBufferView=virtual_views};
++    expected_view=(VkBufferView)(uintptr_t)view->r.h;
++    zss_UpdateDescriptorSets((VkDevice)&dev,1,&write,0,NULL);
++    assert(updates==1 && view->refs==3);
++    struct zss_obj *copy=make_set(&dev,VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER);
++    VkCopyDescriptorSet cp={.sType=VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET,.srcSet=ZHANDLE(VkDescriptorSet,set),.srcBinding=0,.dstSet=ZHANDLE(VkDescriptorSet,copy),.dstBinding=0,.descriptorCount=2};
++    /* Copy between these types is not a valid Vulkan call; adjust the fake set
++     * type only after a valid uniform-to-uniform descriptor copy. */
++    for(uint32_t b=0;b<2;b++)copy->u.dset.slot[b].type=VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
++    zss_UpdateDescriptorSets((VkDevice)&dev,0,NULL,1,&cp);
++    assert(updates==2 && view->refs==5);
++    for(uint32_t b=0;b<2;b++)copy->u.dset.slot[b].type=VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
++    /* View recipe recreates against the new buffer handle. No descriptor
++     * update from the application is needed after migration. */
++    struct zss_real old=view->r;
++    zss_real_destroy(&dev,ZK_BUFFERVIEW,&old);view->r.h=0;
++    buf->r.h=44;expected_buffer=(VkBuffer)(uintptr_t)44;
++    assert(real_buffer_view(&dev,view)==VK_SUCCESS);
++    expected_view=(VkBufferView)(uintptr_t)view->r.h;zss_dset_apply(&dev,set);
++    assert(updates==3 && views_created==2 && views_destroyed==1);
++    dev.native_maint5=false;
++    assert(real_buffer_view(&dev,view)==VK_ERROR_FEATURE_NOT_PRESENT);
++    assert(view->r.h==(uint64_t)(uintptr_t)expected_view);
++    dev.native_maint5=true;view_result=VK_ERROR_OUT_OF_DEVICE_MEMORY;
++    assert(real_buffer_view(&dev,view)==view_result);
++    assert(view->r.h==(uint64_t)(uintptr_t)expected_view);view_result=VK_SUCCESS;
++    struct zss_obj *cb=zss_obj_new(&dev,ZK_CMDBUF);
++    cb->u.cb.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;cb->u.cb.nrefs=1;cb->u.cb.refs=calloc(1,sizeof(void *));cb->u.cb.refs[0]=copy;zss_obj_ref(copy);
++    struct zss_obj *bound_sets[]={copy};
++    struct zss_cmd draw={.op=OP_DRAW,.u={3,1}};
++    struct zss_cmd bind={.op=OP_BIND_DSETS,.u={VK_PIPELINE_BIND_POINT_GRAPHICS,0},.n={1},.a={bound_sets}};
++    cb->u.cb.head=&bind;
++    struct zss_obj *mem=zss_obj_new(&dev,ZK_MEMORY);
++    mem->u.mem.shadow=calloc(1,4);mem->u.mem.size=4;
++    buf->u.buf.mem=mem;buf->u.buf.ci.size=4;zss_obj_dep(buf,mem);
++    uint32_t real_bytes=123;buf->r.map=&real_bytes;
++    buf->u.buf.gpu_written=false;
++    zss_cmd_track_submit(&dev,cb);
++    *(uint32_t *)mem->u.mem.shadow=777;
++    zss_sync_from_device(&dev,NULL);
++    assert(!buf->u.buf.gpu_written && *(uint32_t *)mem->u.mem.shadow==777);
++    bind.next=&draw;
++    for (int i=0;i<2;i++) {
++        buf->u.buf.ret.valid=true;buf->u.buf.gpu_written=false;
++        zss_cmd_track_submit(&dev,cb);
++        assert(buf->u.buf.gpu_written && buf->u.buf.filled && !buf->u.buf.ret.valid);
++    }
++    /* Accepted secondary submissions apply the same dirty tracking. */
++    cb->u.cb.level=VK_COMMAND_BUFFER_LEVEL_SECONDARY;buf->u.buf.gpu_written=false;
++    struct zss_obj *parent=zss_obj_new(&dev,ZK_CMDBUF);
++    parent->u.cb.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    struct zss_obj *secondary[]={cb};
++    struct zss_cmd execute={.op=OP_EXECUTE,.n={1},.a={secondary}};
++    parent->u.cb.head=&execute;
++    zss_cmd_track_submit(&dev,parent);assert(buf->u.buf.gpu_written);
++    parent->u.cb.head=NULL;zss_obj_unref(parent);
++    virtual_views[0]=virtual_views[1]=VK_NULL_HANDLE;expected_view=VK_NULL_HANDLE;
++    zss_UpdateDescriptorSets((VkDevice)&dev,1,&write,0,NULL);
++    assert(set->u.dset.slot[1].e[0].written && !set->u.dset.slot[1].e[0].buffer_view);
++    cb->u.cb.head=NULL;
++    zss_obj_unref(cb);zss_obj_unref(set);zss_obj_unref(copy);
++    assert(view->refs==1 && buf->refs==2);
++    zss_obj_unref(view);assert(buf->refs==1);zss_obj_unref(buf);zss_obj_unref(mem);
++    assert(!dev.head && !dev.tail);
++    puts("PASS: buffer-view recipes, descriptor rollover/copy/replay/null/lifetime, refusal, reusable storage writes");
++    return 0;
++}
+diff --git a/tests/test_device_lifetime.c b/tests/test_device_lifetime.c
+new file mode 100644
+index 0000000..47e5b24
+--- /dev/null
++++ b/tests/test_device_lifetime.c
+@@ -0,0 +1,73 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Exercise actual destruction code against fake driver callbacks, without a GPU.
++ * A submit holds zss_lock while copying mapped buffers. Destruction of another
++ * buffer must wait before releasing its mapping, not only before unlinking it.
++ */
++#include "../src/layer/device.c"
++#include <errno.h>
++#include <stdatomic.h>
++
++pthread_mutex_t zss_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
++static pthread_mutex_t event_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t event = PTHREAD_COND_INITIALIZER;
++static atomic_bool entered, freed;
++
++void zss_enter(void) {}
++void zss_leave(void) {}
++void zss_retain_release(struct zss_ret *ret) {}
++void zss_shadow_free(uint8_t *p, VkDeviceSize size, bool watched) { free(p); }
++void zss_cmd_reset(struct zss_obj *cb) {}
++void zss_presenter_destroy(struct zss_presenter *p, bool gone) {}
++void zss_lower_forget_view(struct zss_dev *dev, VkImageView view) {}
++
++static void VKAPI_CALL fake_destroy(VkDevice d, VkBuffer b, const VkAllocationCallbacks *a)
++{
++    pthread_mutex_lock(&event_lock);
++    entered = true;
++    pthread_cond_signal(&event);
++    pthread_mutex_unlock(&event_lock);
++}
++
++static void VKAPI_CALL fake_free(VkDevice d, VkDeviceMemory m, const VkAllocationCallbacks *a)
++{
++    freed = true;
++}
++
++static void *destroy_thread(void *arg)
++{
++    struct zss_obj *o = arg;
++    zss_DestroyBuffer((VkDevice)o->dev, ZHANDLE(VkBuffer, o), NULL);
++    return NULL;
++}
++
++int main(void)
++{
++    struct zss_dev dev = { .real = (VkDevice)(uintptr_t)1 };
++    struct zss_obj *o = zss_obj_new(&dev, ZK_BUFFER);
++    pthread_t worker;
++    struct timespec until;
++    int rc = 0;
++
++    dev.fn.DestroyBuffer = fake_destroy;
++    dev.fn.FreeMemory = fake_free;
++    o->r.h = 1;
++    o->r.backing = (VkDeviceMemory)(uintptr_t)1;
++    pthread_mutex_lock(&zss_lock); // stand in for the real mapped-memory scan
++    pthread_mutex_lock(&event_lock);
++    if (pthread_create(&worker, NULL, destroy_thread, o)) return 2;
++    clock_gettime(CLOCK_REALTIME, &until);
++    until.tv_nsec += 150000000;
++    if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
++    while (!entered && rc != ETIMEDOUT)
++        rc = pthread_cond_timedwait(&event, &event_lock, &until);
++    const bool raced = entered || freed;
++    pthread_mutex_unlock(&event_lock);
++    pthread_mutex_unlock(&zss_lock);
++    pthread_join(worker, NULL);
++    if (raced || !entered || !freed || dev.head || dev.tail) {
++        fprintf(stderr, "FAIL: mapped object destruction raced the memory scan\n");
++        return 1;
++    }
++    puts("PASS: driver destruction waits for mapped-memory scans");
++    return 0;
++}
+diff --git a/tests/test_launcher.py b/tests/test_launcher.py
+new file mode 100644
+index 0000000..6cb5602
+--- /dev/null
++++ b/tests/test_launcher.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Launcher compatibility tests; fake app binaries, no display or GPU needed."""
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++import unittest
++
++LAUNCHER = Path(__file__).resolve().parents[1] / 'src/layer/zss-run.in'
++
++class ChromiumDisplayTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name)
++        self.app = self.root / 'test-chromium'
++        self.app.write_text('#!/bin/sh\nexit 0\n')
++        self.app.chmod(0o755)
++        (self.root / 'icudtl.dat').touch()
++        (self.root / 'v8_context_snapshot.bin').touch()
++        self.env = dict(os.environ, XDG_SESSION_TYPE='wayland', WAYLAND_DISPLAY='test-wayland')
++        self.env.pop('ZSS_CHROMIUM_PLATFORM', None)
++
++    def launch(self, *args, plain=False, env=None):
++        return subprocess.run(['/bin/sh', str(LAUNCHER), '--print', *(['--plain'] if plain else []),
++            str(self.app), *args], env=env or self.env, capture_output=True, text=True, timeout=5)
++
++    def test_wayland_session_uses_xwayland_for_chromium(self):
++        r = self.launch()
++        self.assertEqual(r.returncode, 0, r.stderr)
++        self.assertIn('--ozone-platform=x11', r.stdout)
++        self.assertIn('--use-angle=vulkan', r.stdout)
++
++    def test_explicit_wayland_choice_is_preserved(self):
++        r = self.launch('--ozone-platform=wayland')
++        self.assertIn('--ozone-platform=wayland', r.stdout)
++        self.assertNotIn('--ozone-platform=x11', r.stdout)
++
++    def test_split_platform_argument_is_preserved(self):
++        r = self.launch('--ozone-platform', 'wayland')
++        self.assertNotIn('--ozone-platform=x11', r.stdout)
++
++    def test_plain_does_not_change_graphics_arguments(self):
++        r = self.launch(plain=True)
++        self.assertNotIn('--ozone-platform', r.stdout)
++        self.assertNotIn('--use-angle', r.stdout)
++
++    def test_non_chromium_app_is_not_changed(self):
++        (self.root / 'icudtl.dat').unlink()
++        r = self.launch()
++        self.assertNotIn('--ozone-platform', r.stdout)
++
++    def test_explicit_environment_choice(self):
++        r = self.launch(env=dict(self.env, ZSS_CHROMIUM_PLATFORM='wayland'))
++        self.assertIn('--ozone-platform=wayland', r.stdout)
++        self.assertNotIn('--ozone-platform=x11', r.stdout)
++
++    def test_invalid_choice_fails_clearly(self):
++        r = self.launch(env=dict(self.env, ZSS_CHROMIUM_PLATFORM='unsupported'))
++        self.assertNotEqual(r.returncode, 0)
++        self.assertIn('must be x11 or wayland', r.stderr)
++
++    def test_x11_session_keeps_existing_default(self):
++        env = dict(self.env, XDG_SESSION_TYPE='x11')
++        env.pop('WAYLAND_DISPLAY', None)
++        r = self.launch(env=env)
++        self.assertNotIn('--ozone-platform', r.stdout)
++
++    def test_child_gpu_filters_are_cleared_and_start_choice_preserved(self):
++        self.app.write_text('#!/bin/sh\nprintf "%s\\n" "${DRI_PRIME-unset}" "${MESA_VK_DEVICE_SELECT-unset}" "${MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE-unset}" "$ZSS_START_ON"\n')
++        env = dict(self.env, DRI_PRIME='pci-0000_03_00_0', MESA_VK_DEVICE_SELECT='1002:73df!', MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE='1')
++        r = subprocess.run(['/bin/sh', str(LAUNCHER), '--plain', '--on', 'any', str(self.app)], env=env, capture_output=True, text=True, timeout=5)
++        self.assertEqual(r.returncode, 0, r.stderr)
++        self.assertEqual(r.stdout.splitlines(), ['unset', 'unset', 'unset', 'any'])
++        self.assertEqual(env['DRI_PRIME'], 'pci-0000_03_00_0')
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/test_move.py b/tests/test_move.py
+new file mode 100644
+index 0000000..d6c18ce
+--- /dev/null
++++ b/tests/test_move.py
+@@ -0,0 +1,148 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Render-only protocol regression tests. Fake clients, no GPU or power backend."""
++import json
++import os
++import socket
++import threading
++import time
++from zsstest import Daemon, FAKE_PCI, check, run_scenarios
++
++OTHER_PCI = 'ffff:01:00.0'
++
++class Client:
++    def __init__(self,d,migratable=True,park=False,restore_park=False,on_source=True,origin_gpu=FAKE_PCI,render_only=True):
++        self.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);self.sock.settimeout(4);self.sock.connect(d.socket)
++        self.stream=self.sock.makefile('r');self.messages=[];self.requests=[];self.restore_gpus=[];self.error=None;self.park=park;self.restore_park=restore_park;self.origin=int(on_source and origin_gpu==FAKE_PCI)
++        self.send(type='register',name='fake-renderer',render_only_version=int(render_only))
++        welcome=json.loads(self.stream.readline());check(welcome['type']=='welcome',str(welcome))
++        self.state(int(on_source),migratable)
++        if origin_gpu != FAKE_PCI:
++            self.send(type='state',gpu=origin_gpu,devices=0,origin=1,holds=False,migratable=True,parked=0)
++        # A same-socket status roundtrip orders the state before the CLI request.
++        self.send(type='status')
++        while json.loads(self.stream.readline())['type']!='end':pass
++        self.thread=threading.Thread(target=self.answer,daemon=True);self.thread.start()
++    def send(self,**message):self.sock.sendall((json.dumps(message)+'\n').encode())
++    def state(self,devices,migratable=True,parked=0):
++        self.send(type='state',gpu=FAKE_PCI,devices=devices,origin=self.origin,holds=True,migratable=migratable,parked=parked)
++    def answer(self):
++        try:
++            while line:=self.stream.readline():
++                m=json.loads(line);self.messages.append(m['type']);self.requests.append(m)
++                if m['type']=='migrate':
++                    self.state(0,parked=int(self.park));self.send(type='outcome',id=m['id'],result='parked' if self.park else 'migrated')
++                elif m['type']=='restore':
++                    self.restore_gpus.append(m['gpu'])
++                    if m['gpu']==FAKE_PCI:self.state(0 if self.restore_park else 1,parked=int(self.restore_park))
++                    else:self.send(type='state',gpu=m['gpu'],devices=1,origin=1,holds=True,migratable=True,parked=0)
++                    self.send(type='outcome',id=m['id'],result='parked' if self.restore_park else 'migrated')
++        except (OSError,ValueError):pass
++        except Exception as e:self.error=str(e)
++    def close(self):
++        self.sock.shutdown(socket.SHUT_RDWR);self.thread.join(1);self.stream.close();self.sock.close()
++        check(self.error is None,str(self.error))
++
++def pure_move_needs_no_backend_and_keeps_gpu_attached():
++    d=Daemon('--gpu',FAKE_PCI,'--allow-software')
++    c=None
++    try:
++        c=Client(d)
++        rc,out=d.ctl('move',FAKE_PCI,'--to','software',timeout=6);check(rc==0 and '1 application(s) moved' in out,out)
++        rc,out=d.ctl('status');check('backend=none' in out and 'migrated-away' in out and 'dry run' not in out,out)
++        rc,out=d.ctl('restore',FAKE_PCI,timeout=6);check(rc==0 and 'rendering restored' in out,out)
++        rc,out=d.ctl('status');check('state=attached' in out and 'migrated-away' not in out,out)
++        check(c.messages==['migrate','restore'],str(c.messages))
++        check('detaching' not in d.log_text(),'render-only operation entered hardware detach')
++    finally:
++        if c:c.close()
++        d.stop()
++
++def bad_targets_do_not_touch_clients():
++    d=Daemon('--gpu',FAKE_PCI)
++    c=None
++    try:
++        c=Client(d)
++        for args in [('move',FAKE_PCI),('move',FAKE_PCI,'--to',FAKE_PCI),('move',FAKE_PCI,'--to','software'),('move',FAKE_PCI,'--to','no-such-gpu')]:
++            rc,out=d.ctl(*args,timeout=6);check(rc!=0,out)
++        check(not c.messages,str(c.messages))
++    finally:
++        if c:c.close()
++        d.stop()
++
++def non_migratable_is_rejected_before_moving():
++    d=Daemon('--gpu',FAKE_PCI,'--allow-software');c=None
++    try:
++        c=Client(d,migratable=False)
++        rc,out=d.ctl('move',FAKE_PCI,'--to','software',timeout=6)
++        check(rc!=0 and 'not migratable' in out,out);check(not c.messages,str(c.messages))
++    finally:
++        if c:c.close()
++        d.stop()
++
++def parked_client_is_restored_not_frozen_or_reported_as_success():
++    d=Daemon('--gpu',FAKE_PCI,'--allow-software');c=None
++    try:
++        c=Client(d,park=True)
++        rc,out=d.ctl('move',FAKE_PCI,'--to','software',timeout=6)
++        check(rc!=0 and 'origin restore requested' in out,out)
++        check(c.messages==['migrate','restore'],str(c.messages))
++        rc,out=d.ctl('status');check(' parked' not in out and 'migrated-away' not in out,out)
++    finally:
++        if c:c.close()
++        d.stop()
++
++def parked_restore_is_not_reported_as_success():
++    d=Daemon('--gpu',FAKE_PCI,'--allow-software');c=None
++    try:
++        c=Client(d,restore_park=True)
++        rc,out=d.ctl('move',FAKE_PCI,'--to','software',timeout=6);check(rc==0,out)
++        rc,out=d.ctl('restore',FAKE_PCI,timeout=6)
++        check(rc!=0 and 'did not complete the rendering restore' in out,out)
++    finally:
++        if c:c.close()
++        d.stop()
++
++def failed_reverse_move_restores_actual_origin_and_leaves_others_alone():
++    d=Daemon('--gpu',FAKE_PCI,'--gpu',OTHER_PCI,'--allow-software');c=unrelated=None
++    try:
++        c=Client(d,park=True,origin_gpu=OTHER_PCI)
++        unrelated=Client(d,on_source=False,origin_gpu=OTHER_PCI)
++        rc,out=d.ctl('move',FAKE_PCI,'--to','software',timeout=6)
++        check(rc!=0 and 'origin restore requested' in out,out)
++        check(c.restore_gpus==[OTHER_PCI],str(c.restore_gpus))
++        check(not unrelated.messages,str(unrelated.messages))
++    finally:
++        if c:c.close()
++        if unrelated:unrelated.close()
++        d.stop()
++
++def restore_ignores_unrelated_clients():
++    d=Daemon('--gpu',FAKE_PCI);c=None
++    try:
++        c=Client(d,on_source=False)
++        rc,out=d.ctl('restore',FAKE_PCI,timeout=6)
++        check(rc==0,out);check(not c.messages,str(c.messages))
++    finally:
++        if c:c.close()
++        d.stop()
++
++def authorisation_applies_to_both_new_operations():
++    if os.geteuid()==0:return 'root is always authorised'
++    d=Daemon('--gpu',FAKE_PCI,'--allow-software','--no-owner-access','--group','zss-no-such-group')
++    try:
++        for args in [('move',FAKE_PCI,'--to','software'),('restore',FAKE_PCI)]:
++            rc,out=d.ctl(*args,timeout=6);check(rc!=0 and 'permission denied' in out,out)
++    finally:d.stop()
++
++if __name__=='__main__':
++    raise SystemExit(run_scenarios([
++      ('render-only move and restore without a power backend',pure_move_needs_no_backend_and_keeps_gpu_attached),
++      ('bad targets leave clients alone',bad_targets_do_not_touch_clients),
++      ('known non-migratable contexts refuse before moving',non_migratable_is_rejected_before_moving),
++      ('parked move fails and restores instead of freezing',parked_client_is_restored_not_frozen_or_reported_as_success),
++      ('parked restore is reported as a failure',parked_restore_is_not_reported_as_success),
++      ('failed reverse move restores actual origin without unrelated clients',failed_reverse_move_restores_actual_origin_and_leaves_others_alone),
++      ('restore leaves unrelated clients alone',restore_ignores_unrelated_clients),
++      ('move and restore enforce authorisation',authorisation_applies_to_both_new_operations),
++    ]))
+diff --git a/tests/test_query_pool.py b/tests/test_query_pool.py
+new file mode 100644
+index 0000000..1b5ab3c
+--- /dev/null
++++ b/tests/test_query_pool.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Explicit two-GPU probe. No submissions, hardware detach or power changes."""
++import json
++import os
++from pathlib import Path
++import selectors
++import subprocess
++import sys
++import tempfile
++from zsstest import Daemon, BUILD, ZSS_RUN, check
++
++if len(sys.argv) != 3:
++    raise SystemExit('usage: test_query_pool.py SOURCE_PCI TARGET_PCI')
++source, target = sys.argv[1:]
++results = []
++for used in (False, True):
++    daemon = Daemon('--gpu', source + '=dry-run', '--gpu', target + '=dry-run', '--no-auto-attach')
++    app = None
++    try:
++        env = daemon.env({'ZSS_START_ON': source, 'ZSS_RETAIN': 'ram'})
++        for key in ('DRI_PRIME', 'MESA_VK_DEVICE_SELECT', 'MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE',
++                    'VK_DRIVER_FILES', 'VK_ICD_FILENAMES', 'VK_INSTANCE_LAYERS', 'LD_PRELOAD'):
++            env.pop(key, None)
++        with tempfile.TemporaryFile(mode='w+') as log:
++            app = subprocess.Popen(['/bin/sh', ZSS_RUN, '--plain', BUILD + '/tests/zss-query-probe',
++                                    *(['use'] if used else [])], env=env, stdin=subprocess.PIPE,
++                                   stdout=subprocess.PIPE, stderr=log, text=True)
++            with selectors.DefaultSelector() as selector:
++                selector.register(app.stdout, selectors.EVENT_READ)
++                check(bool(selector.select(timeout=8)), 'Query probe did not become ready')
++            check(app.stdout.readline().strip() == 'ready', 'Query probe startup failed')
++            rc, before = daemon.ctl('status')
++            check(rc == 0 and str(app.pid) in before, before)
++            rc, moved = daemon.ctl('move', source, '--to', target, timeout=15)
++            if used:
++                check(rc != 0 and 'query commands' in before, before + moved)
++            else:
++                check(rc == 0, moved)
++                rc, status = daemon.ctl('status')
++                check(rc == 0 and 'migrated-away' in status, status)
++                rc, returned = daemon.ctl('move', target, '--to', source, timeout=15)
++                check(rc == 0, returned)
++                rc, restored = daemon.ctl('restore', source, timeout=15)
++                check(rc == 0, restored)
++            app.communicate('\n', timeout=5)
++            check(app.returncode == 0, 'Query probe shutdown failed')
++            results.append({'used': used, 'pass': True, 'before': before, 'move': moved})
++    finally:
++        if app is not None and app.poll() is None:
++            app.kill(); app.wait()
++        daemon.stop()
++print(json.dumps({'pass': True, 'source': source, 'target': target, 'cases': results}, indent=2))
+diff --git a/tests/test_texel_buffers.py b/tests/test_texel_buffers.py
+new file mode 100644
+index 0000000..6be3ad8
+--- /dev/null
++++ b/tests/test_texel_buffers.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++"""Two real GPUs, six one-fragment draws, same descriptors and mapped pointers."""
++import json
++import os
++from pathlib import Path
++import selectors
++import subprocess
++import sys
++import tempfile
++from zsstest import Daemon, BUILD, ZSS_RUN, check
++
++source,target=sys.argv[1:3]
++baseline='--baseline' in sys.argv[3:]
++daemon=Daemon('--gpu',source+'=dry-run','--gpu',target+'=dry-run','--no-auto-attach')
++app=None
++result={'pass':False,'baseline':baseline,'source':source,'target':target,'submissions':6,'fragmentsPerSubmission':1,'stages':[]}
++try:
++ env=daemon.env({'ZSS_START_ON':source,'ZSS_RETAIN':'ram'})
++ for key in ('DRI_PRIME','MESA_VK_DEVICE_SELECT','MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE','VK_DRIVER_FILES','VK_ICD_FILENAMES','VK_INSTANCE_LAYERS','LD_PRELOAD'):
++  env.pop(key,None)
++ if baseline:env['ZSS_MANIFEST']='/opt/frost-gpu/share/zss_icd.json'
++ with tempfile.TemporaryFile(mode='w+') as log:
++  app=subprocess.Popen(['/bin/sh',ZSS_RUN,'--plain',BUILD+'/tests/zss-texel-probe'],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=log,text=True)
++  result['pid']=app.pid
++  def stage(n):
++   with selectors.DefaultSelector() as select:
++    select.register(app.stdout,selectors.EVENT_READ)
++    check(bool(select.select(timeout=12)),'Texel probe timed out')
++   line=app.stdout.readline().strip()
++   check(line==f'stage {n} value {(n+1)*10}','Unexpected storage readback: '+repr(line))
++   result['stages'].append({'index':n,'value':(n+1)*10})
++  try:
++   stage(0)
++   rc,before=daemon.ctl('status');result['before']=before
++   check(rc==0 and 'migratable\n' in before,before)
++   for n,(origin,dest) in enumerate(((source,target),(target,source)),1):
++    rc,moved=daemon.ctl('move',origin,'--to',dest,timeout=20)
++    check(rc==0,moved)
++    app.stdin.write('\n');app.stdin.flush();stage(n)
++   app.communicate(timeout=5);check(app.returncode==0,'Probe cleanup failed')
++   result['pass']=True
++  except Exception as error:
++   result['error']=str(error)
++  finally:
++   if app.poll() is None:app.kill();app.wait()
++   log.seek(0);result['logTail']=log.read()[-1500:]
++finally:
++ if app is not None and app.poll() is None:app.kill();app.wait()
++ daemon.stop()
++print(json.dumps(result,indent=2))
++raise SystemExit(0 if result['pass'] else 1)
+diff --git a/tests/testapp/texel.frag b/tests/testapp/texel.frag
+new file mode 100644
+index 0000000..42af839
+--- /dev/null
++++ b/tests/testapp/texel.frag
+@@ -0,0 +1,6 @@
++#version 450
++layout(set=0,binding=0) uniform usamplerBuffer source;
++layout(set=0,binding=1,r32ui) uniform uimageBuffer accumulator;
++void main() {
++    imageStore(accumulator,0,uvec4(imageLoad(accumulator,0).x+texelFetch(source,0).x));
++}
+diff --git a/tests/testapp/texel.vert b/tests/testapp/texel.vert
+new file mode 100644
+index 0000000..8a00119
+--- /dev/null
++++ b/tests/testapp/texel.vert
+@@ -0,0 +1,5 @@
++#version 450
++void main() {
++    vec2 p[3]=vec2[3](vec2(-1,-1),vec2(3,-1),vec2(-1,3));
++    gl_Position=vec4(p[gl_VertexIndex],0,1);
++}
+diff --git a/tests/testapp/zss-query-probe.c b/tests/testapp/zss-query-probe.c
+new file mode 100644
+index 0000000..521b8e6
+--- /dev/null
++++ b/tests/testapp/zss-query-probe.c
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* No GPU submissions: distinguish an allocated pool from a recorded query. */
++#include <vulkan/vulkan.h>
++#include <stdio.h>
++#include <stdlib.h>
++#define OK(call) do { VkResult r = (call); if (r != VK_SUCCESS) { fprintf(stderr, "%s: %d\n", #call, r); return 2; } } while (0)
++int main(int argc, char **argv)
++{
++    VkInstance instance;
++    VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
++    OK(vkCreateInstance(&ici, NULL, &instance));
++    uint32_t count = 1;
++    VkPhysicalDevice physical;
++    VkResult result = vkEnumeratePhysicalDevices(instance, &count, &physical);
++    if ((result != VK_SUCCESS && result != VK_INCOMPLETE) || !count) return 3;
++    VkQueueFamilyProperties families[64];
++    count = 64;
++    vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, families);
++    uint32_t family;
++    for (family = 0; family < count; ++family)
++        if (families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) break;
++    if (family == count) return 4;
++    float priority = 1;
++    VkDeviceQueueCreateInfo queue = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++        .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &priority };
++    VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++        .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue };
++    VkDevice device;
++    OK(vkCreateDevice(physical, &dci, NULL, &device));
++    VkQueryPoolCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
++        .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 };
++    VkQueryPool pool;
++    OK(vkCreateQueryPool(device, &qci, NULL, &pool));
++    VkCommandPool commands = VK_NULL_HANDLE;
++    if (argc > 1) {
++        VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = family };
++        OK(vkCreateCommandPool(device, &pci, NULL, &commands));
++        VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++            .commandPool = commands, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
++        VkCommandBuffer cb;
++        OK(vkAllocateCommandBuffers(device, &ai, &cb));
++        VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++        OK(vkBeginCommandBuffer(cb, &bi));
++        vkCmdResetQueryPool(cb, pool, 0, 2);
++        OK(vkEndCommandBuffer(cb));
++    }
++    puts("ready"); fflush(stdout);
++    getchar();
++    if (commands) vkDestroyCommandPool(device, commands, NULL);
++    vkDestroyQueryPool(device, pool, NULL);
++    vkDestroyDevice(device, NULL);
++    vkDestroyInstance(instance, NULL);
++    return 0;
++}
+diff --git a/tests/testapp/zss-texel-probe.c b/tests/testapp/zss-texel-probe.c
+new file mode 100644
+index 0000000..cd7ae9f
+--- /dev/null
++++ b/tests/testapp/zss-texel-probe.c
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Six one-fragment submissions, retained bindings and byte-exact readback. */
++#include <vulkan/vulkan.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include "texel_vert.h"
++#include "texel_frag.h"
++#define OK(call) do { VkResult r=(call); if(r!=VK_SUCCESS){fprintf(stderr,"%s: %d\n",#call,r);exit(2);} }while(0)
++static VkDevice dev;
++static VkPhysicalDeviceMemoryProperties memory;
++static VkBuffer buffer(VkBufferUsageFlags usage,VkDeviceMemory *allocation,uint32_t **map)
++{
++    VkBufferCreateInfo ci={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=4,.usage=usage};
++    VkBuffer b;OK(vkCreateBuffer(dev,&ci,NULL,&b));
++    VkMemoryRequirements req;vkGetBufferMemoryRequirements(dev,b,&req);
++    uint32_t i;
++    for(i=0;i<memory.memoryTypeCount;i++)if((req.memoryTypeBits&(1u<<i)) && (memory.memoryTypes[i].propertyFlags&(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))==(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))break;
++    if(i==memory.memoryTypeCount)exit(3);
++    VkMemoryAllocateInfo ai={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=req.size,.memoryTypeIndex=i};
++    OK(vkAllocateMemory(dev,&ai,NULL,allocation));OK(vkBindBufferMemory(dev,b,*allocation,0));OK(vkMapMemory(dev,*allocation,0,4,0,(void **)map));return b;
++}
++static VkShaderModule shader(const uint32_t *code,size_t size)
++{
++    VkShaderModuleCreateInfo ci={.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,.codeSize=size,.pCode=code};VkShaderModule module;
++    OK(vkCreateShaderModule(dev,&ci,NULL,&module));return module;
++}
++int main(void)
++{
++    VkApplicationInfo appinfo={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
++    VkInstance instance;VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&appinfo};OK(vkCreateInstance(&ici,NULL,&instance));
++    uint32_t count=1;VkPhysicalDevice pd;VkResult result=vkEnumeratePhysicalDevices(instance,&count,&pd);
++    if((result!=VK_SUCCESS && result!=VK_INCOMPLETE)||!count)return 3;
++    VkPhysicalDeviceFeatures features;vkGetPhysicalDeviceFeatures(pd,&features);if(!features.fragmentStoresAndAtomics)return 4;
++    vkGetPhysicalDeviceMemoryProperties(pd,&memory);
++    VkQueueFamilyProperties families[64];count=64;vkGetPhysicalDeviceQueueFamilyProperties(pd,&count,families);
++    uint32_t family;for(family=0;family<count;family++)if(families[family].queueFlags&VK_QUEUE_GRAPHICS_BIT)break;
++    if(family==count)return 4;
++    float priority=1;VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=family,.queueCount=1,.pQueuePriorities=&priority};
++    VkPhysicalDeviceFeatures enabled={.fragmentStoresAndAtomics=VK_TRUE};
++    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci,.pEnabledFeatures=&enabled};OK(vkCreateDevice(pd,&dci,NULL,&dev));
++    VkQueue queue;vkGetDeviceQueue(dev,family,0,&queue);
++    VkDeviceMemory allocations[2];uint32_t *mapped[2];
++    VkBuffer buffers[2]={buffer(VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT,&allocations[0],&mapped[0]),buffer(VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT,&allocations[1],&mapped[1])};
++    *mapped[0]=5;*mapped[1]=0;
++    VkBufferView views[2];
++    for(int i=0;i<2;i++){VkBufferViewCreateInfo ci={.sType=VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,.buffer=buffers[i],.format=VK_FORMAT_R32_UINT,.range=4};OK(vkCreateBufferView(dev,&ci,NULL,&views[i]));}
++    VkDescriptorSetLayoutBinding bindings[2]={{.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT},{.binding=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT}};
++    VkDescriptorSetLayoutCreateInfo slci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=2,.pBindings=bindings};VkDescriptorSetLayout layout;OK(vkCreateDescriptorSetLayout(dev,&slci,NULL,&layout));
++    VkDescriptorPoolSize sizes[2]={{VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,1},{VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,1}};
++    VkDescriptorPoolCreateInfo dpci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=2,.pPoolSizes=sizes};VkDescriptorPool pool;OK(vkCreateDescriptorPool(dev,&dpci,NULL,&pool));
++    VkDescriptorSetAllocateInfo sai={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=pool,.descriptorSetCount=1,.pSetLayouts=&layout};VkDescriptorSet set;OK(vkAllocateDescriptorSets(dev,&sai,&set));
++    VkWriteDescriptorSet writes[2];for(int i=0;i<2;i++)writes[i]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=set,.dstBinding=i,.descriptorCount=1,.descriptorType=bindings[i].descriptorType,.pTexelBufferView=&views[i]};
++    vkUpdateDescriptorSets(dev,2,writes,0,NULL);
++    VkDescriptorUpdateTemplateEntry entries[2];
++    for(int i=0;i<2;i++)entries[i]=(VkDescriptorUpdateTemplateEntry){.dstBinding=i,.descriptorCount=1,.descriptorType=bindings[i].descriptorType,.offset=i*sizeof(VkBufferView),.stride=sizeof(VkBufferView)};
++    VkDescriptorUpdateTemplateCreateInfo tci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,.descriptorUpdateEntryCount=2,.pDescriptorUpdateEntries=entries,.templateType=VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET,.descriptorSetLayout=layout};
++    VkDescriptorUpdateTemplate tmpl;OK(vkCreateDescriptorUpdateTemplate(dev,&tci,NULL,&tmpl));
++    entries[0].offset=sizeof(VkBufferView); /* creation must have copied this */
++    vkUpdateDescriptorSetWithTemplate(dev,set,tmpl,views);
++    vkDestroyDescriptorUpdateTemplate(dev,tmpl,NULL);
++    VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&layout};VkPipelineLayout pipeline_layout;OK(vkCreatePipelineLayout(dev,&plci,NULL,&pipeline_layout));
++    VkSubpassDescription subpass={.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS};
++    VkRenderPassCreateInfo rpci={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,.subpassCount=1,.pSubpasses=&subpass};VkRenderPass renderpass;OK(vkCreateRenderPass(dev,&rpci,NULL,&renderpass));
++    VkFramebufferCreateInfo fbci={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=renderpass,.width=1,.height=1,.layers=1};VkFramebuffer framebuffer;OK(vkCreateFramebuffer(dev,&fbci,NULL,&framebuffer));
++    VkShaderModule modules[2]={shader(texel_vert_spv,sizeof(texel_vert_spv)),shader(texel_frag_spv,sizeof(texel_frag_spv))};
++    VkPipelineShaderStageCreateInfo stages[2]={{.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_VERTEX_BIT,.module=modules[0],.pName="main"},{.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=modules[1],.pName="main"}};
++    VkPipelineVertexInputStateCreateInfo vertex={.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++    VkPipelineInputAssemblyStateCreateInfo assembly={.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
++    VkViewport viewport={.width=1,.height=1,.maxDepth=1};VkRect2D scissor={.extent={1,1}};
++    VkPipelineViewportStateCreateInfo vp={.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,.viewportCount=1,.pViewports=&viewport,.scissorCount=1,.pScissors=&scissor};
++    VkPipelineRasterizationStateCreateInfo raster={.sType=VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,.polygonMode=VK_POLYGON_MODE_FILL,.cullMode=VK_CULL_MODE_NONE,.frontFace=VK_FRONT_FACE_COUNTER_CLOCKWISE,.lineWidth=1};
++    VkPipelineMultisampleStateCreateInfo samples={.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT};
++    VkPipelineColorBlendStateCreateInfo blend={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++    VkGraphicsPipelineCreateInfo gpci={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=2,.pStages=stages,.pVertexInputState=&vertex,.pInputAssemblyState=&assembly,.pViewportState=&vp,.pRasterizationState=&raster,.pMultisampleState=&samples,.pColorBlendState=&blend,.layout=pipeline_layout,.renderPass=renderpass};VkPipeline pipeline;OK(vkCreateGraphicsPipelines(dev,VK_NULL_HANDLE,1,&gpci,NULL,&pipeline));
++    VkCommandPoolCreateInfo cpci={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=family};VkCommandPool commands;OK(vkCreateCommandPool(dev,&cpci,NULL,&commands));
++    VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=commands,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};VkCommandBuffer cb;OK(vkAllocateCommandBuffers(dev,&cai,&cb));
++    VkCommandBufferBeginInfo cbi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};OK(vkBeginCommandBuffer(cb,&cbi));
++    VkRenderPassBeginInfo rbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=renderpass,.framebuffer=framebuffer,.renderArea={.extent={1,1}}};
++    vkCmdBeginRenderPass(cb,&rbi,VK_SUBPASS_CONTENTS_INLINE);vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline_layout,0,1,&set,0,NULL);vkCmdDraw(cb,3,1,0,0);vkCmdEndRenderPass(cb);
++    VkBufferMemoryBarrier barrier={.sType=VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,.dstAccessMask=VK_ACCESS_HOST_READ_BIT|VK_ACCESS_SHADER_READ_BIT,.srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.buffer=buffers[1],.size=4};
++    vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT|VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,0,0,NULL,1,&barrier,0,NULL);OK(vkEndCommandBuffer(cb));
++    for(uint32_t stage=0;stage<3;stage++){
++        if(stage && getchar()!='\n')return 5;
++        for(uint32_t repeat=0;repeat<2;repeat++){
++            VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cb};OK(vkQueueSubmit(queue,1,&si,VK_NULL_HANDLE));OK(vkQueueWaitIdle(queue));
++            uint32_t expected=5*(stage*2+repeat+1);
++            if(*mapped[1]!=expected){fprintf(stderr,"storage mismatch stage=%u repeat=%u expected=%u actual=%u\n",stage,repeat,expected,*mapped[1]);return 6;}
++        }
++        printf("stage %u value %u\n",stage,*mapped[1]);fflush(stdout);
++    }
++    vkDestroyCommandPool(dev,commands,NULL);vkDestroyPipeline(dev,pipeline,NULL);vkDestroyFramebuffer(dev,framebuffer,NULL);vkDestroyRenderPass(dev,renderpass,NULL);vkDestroyPipelineLayout(dev,pipeline_layout,NULL);vkDestroyDescriptorPool(dev,pool,NULL);vkDestroyDescriptorSetLayout(dev,layout,NULL);
++    for(int i=0;i<2;i++){vkDestroyShaderModule(dev,modules[i],NULL);vkDestroyBufferView(dev,views[i],NULL);vkUnmapMemory(dev,allocations[i]);vkDestroyBuffer(dev,buffers[i],NULL);vkFreeMemory(dev,allocations[i],NULL);}
++    vkDestroyDevice(dev,NULL);vkDestroyInstance(instance,NULL);return 0;
++}

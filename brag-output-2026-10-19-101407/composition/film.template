@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Frost GPU • Keep going</title><link rel="stylesheet" href="film.css"></head><body>
+<main id="film" data-composition-id="frost-film" data-width="1920" data-height="1080" data-duration="24">
+<div id="intro-wrap" class="video-wrap"><video id="intro-video" class="clip footage" src="assets/blender/intro.webm" poster="assets/blender/intro-start.webp" muted playsinline data-start="0" data-duration="3.35" data-track-index="0"></video></div>
+<section id="opening" class="clip scene" data-start="0" data-duration="3.35" data-track-index="1">
+
+ <div class="opening-copy" data-layout-allow-overflow><div class="small-brand">Frost GPU</div><h1><span class="word-mask"><span id="unplug">Unplug.</span></span><span class="word-mask"><span id="keep">Keep going.</span></span></h1><p id="opening-sub"><span>A different GPU.</span><span>Your desktop, still here.</span></p></div>
+</section>
+<div id="product-wrap" class="video-wrap"><video id="product-video" class="clip footage" src="assets/blender/product.webm" poster="assets/blender/product-start.webp" muted playsinline data-start="2.8" data-duration="3.5" data-track-index="2"></video></div>
+<section id="product-copy" class="clip scene copy-only" data-start="2.8" data-duration="3.5" data-track-index="3"><h2 id="desktop-title"><span>Keep your</span><span>desktop.</span></h2><p class="product-note" id="product-note">KDE stays open.</p></section>
+<section id="workspace" class="clip scene workspace" data-start="6.3" data-duration="5.05" data-track-index="3">
+ <h2 id="same-windows">Same windows. Different GPU.</h2>
+ <div class="desktop-frame" id="desktop-frame"><img id="desktop-before" data-layout-allow-overflow src="assets/desktop/desktop-rx.png" alt="Brave, VSCodium and a translucent WezTerm window on the RX renderer"><img id="desktop-after" data-layout-allow-overflow src="assets/desktop/desktop-igpu.png" alt="The same open workspace on the Vega renderer"></div>
+ <div class="renderer-state"><span id="rx-state">RX 6800M</span><span id="igpu-state">Vega iGPU</span></div>
+ <p class="evidence-note">Real KWin renderer switch. Triggered manually for this capture.</p>
+</section>
+<div id="cut-wrap" class="video-wrap"><video id="cut-video" class="clip footage" src="assets/blender/cut.webm" poster="assets/blender/cut-start.webp" muted playsinline data-start="10.8" data-duration="5" data-track-index="4"></video></div>
+<section id="cut-copy" class="clip scene copy-only" data-start="10.8" data-duration="5" data-track-index="5">
+ <div class="cut-title-scrim"></div><h2 id="cut-title">Two GPUs. One session.</h2>
+ <svg id="handoff-lines" viewBox="0 0 1920 1080" aria-hidden="true"><path id="handoff-path" d="M 1114.5 684.5 C 1144.5 904.5, 740.5 830.9, 705.5 440.9"/><circle id="apu-point" cx="705.5" cy="440.9" r="15"/><circle id="rx-point" cx="1114.5" cy="684.5" r="15"/></svg>
+ <div class="chip-label" id="apu-label"><b>Ryzen + Vega</b><span>Integrated graphics</span></div><div class="chip-label" id="rx-label"><b>RX 6800M</b><span>Discrete graphics</span></div>
+ <div id="renderer-handoff">Renderer handoff</div>
+ <p class="cut-note">Illustrated cutaway. Openings in the heat spreader expose the chips.</p>
+</section>
+<section id="policy" class="clip scene policy" data-start="15.8" data-duration="4" data-track-index="6">
+ <h2 id="policy-title">Power decides.</h2>
+ <div class="policy-row" id="battery-row"><svg viewBox="0 0 80 56" class="power-icon" aria-hidden="true"><rect x="3" y="8" width="64" height="40" rx="5"/><path d="M70 20h6v16h-6M14 18v20M25 18v20M36 18v20"/></svg><div><p>Battery or USB-C PD</p><strong>Vega iGPU</strong></div><span class="policy-detail">Let the RX rest.</span></div>
+ <div class="policy-rule" id="policy-rule"></div>
+ <div class="policy-row" id="barrel-row"><svg viewBox="0 0 80 56" class="power-icon" aria-hidden="true"><path d="M6 28h30m0-13v26h22V15zM58 20h17v16H58"/></svg><div><p>Barrel charger</p><strong>RX 6800M</strong></div><span class="policy-detail">Bring back the power.</span></div>
+ <p class="support-note" id="support-note">Experimental AMD / AMD session. Live migration requires supported apps.</p>
+</section>
+<section id="end" class="clip scene end" data-start="19.8" data-duration="4.2" data-track-index="7"><img id="end-laptop" src="assets/blender/product-end.webp" alt="Matched G513QY model with the actual desktop on screen"><div id="end-copy"><div class="brand-symbol"><i></i><i></i><i></i></div><h2 id="brand-title">Frost GPU</h2><p id="tagline">Your desktop stays with you.</p><p id="repo">github.com/ilyasmohaimel/frost-gpu</p><p id="source-note">Source, patches and a porting guide.</p></div><p class="music-credit">Music: “Machina” by Scott Buckley · CC BY 4.0</p></section>
+<audio id="film-music" src="assets/music/film-mix.wav" data-start="0" data-duration="24" data-track-index="8" data-volume="1"></audio>
+</main><script src="vendor/gsap.min.js"></script><script type="module" src="film.js"></script></body></html>

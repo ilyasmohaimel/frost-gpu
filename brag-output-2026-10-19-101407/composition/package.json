@@ -1,0 +1,20 @@
+{
+  "name": "frost-gpu-hardware-film",
+  "version": "1.0.0",
+  "description": "A custom 3D film about an unbroken KDE workspace",
+  "scripts": {
+    "dev": "hyperframes preview",
+    "check": "hyperframes check",
+    "render": "hyperframes render --quality delivery --fps 60 --workers 1 --video-frame-format png --no-browser-gpu --output ../brag-render.mp4",
+    "finalize": "python ../production/finalize-mp4.py"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "dependencies": {
+    "gsap": "3.15.0",
+    "hyperframes": "0.8.168"
+  },
+  "private": true,
+  "license": "GPL-2.0-only",
+  "author": "Ilyas Mohaimel"
+}

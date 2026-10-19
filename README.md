@@ -67,12 +67,19 @@ stayed alive. USB-C PD was then tested with the same iGPU and D3cold result.
 
 ## A short tour
 
-[![Watch the 22-second animated project tour.](brag-output/preview.gif)](https://github.com/ilyasmohaimel/frost-gpu/blob/main/brag-output/brag.mp4)
+[![Watch the 24-second Frost GPU film.](brag-output-2026-10-19-101407/brag.jpg)](https://github.com/ilyasmohaimel/frost-gpu/blob/main/brag-output-2026-10-19-101407/brag.mp4)
 
-[Watch or download the MP4](brag-output/brag.mp4).
-This is an illustrated explanation of the tested behavior, not a desktop
-recording or a timing benchmark. Its [editable composition](brag-output/composition)
-and [storyboard](brag-output/brag-plan.md) are included.
+[Watch or download the MP4](brag-output-2026-10-19-101407/brag.mp4).
+A custom G513QY model, an illustrated hardware cutaway, a real Brave screen
+recording and paired captures of a manually triggered KWin renderer switch.
+The cutaway uses an RX-rendered still with a slow camera push. This is not a
+charger-switch timing benchmark.
+
+The [editable composition](brag-output-2026-10-19-101407/composition),
+[Blender source](brag-output-2026-10-19-101407/production) and
+[storyboard](brag-output-2026-10-19-101407/brag-plan.md) are included.
+Music: [“Machina” by Scott Buckley](https://www.scottbuckley.com.au/library/machina/),
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 
 ## What happens to open apps?
 
@@ -147,6 +154,7 @@ examples/            Hardware mapping used by the inspection tool
 docs/                Architecture, app support, build, porting, and recovery
 assets/              Project artwork and architecture diagram
 brag-output/         Short video, poster, storyboard, and editable composition
+brag-output-2026-10-19-101407/  Latest film, matched model source, and real captures
 ```
 
 ## Credits and license

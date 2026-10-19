@@ -1,0 +1,22 @@
+{
+  "product": {
+    "elapsedSeconds": 275.8,
+    "frames": 210,
+    "fps": 60
+  },
+  "cut": {
+    "frames": 300,
+    "fps": 60,
+    "elapsedSeconds": 26.8,
+    "sourceSha256": "29e511a47d31b17bfd19e6090d384ba93f3d3bb6d4179a26d78b5e8fc580aadc",
+    "metadata": {
+      "width": 1920,
+      "height": 1080,
+      "avg_frame_rate": "60/1",
+      "nb_read_frames": "300"
+    },
+    "technique": "RX-rendered still with a centered 4.5 percent camera push",
+    "renderedFrame": "frame-0001.png; inward-set blower edge exposed",
+    "frameSha256": "009c556dbd874fecdb5997a399bba6397929b9872138924ad9e8fa000c9c445d"
+  }
+}

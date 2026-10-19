@@ -1,0 +1,8 @@
+Frost GPU: unplug, keep going.
+
+An experimental KDE session that moves rendering between Vega and the RX 6800M while supported apps stay open. Battery and USB-C prefer the iGPU; the barrel charger selects the RX.
+
+Source and supported-app notes: https://github.com/ilyasmohaimel/frost-gpu
+
+Music: “Machina” by Scott Buckley, CC BY 4.0.
+https://www.scottbuckley.com.au/library/machina/

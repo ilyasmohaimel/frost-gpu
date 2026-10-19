@@ -1,0 +1,17 @@
+composition/node_modules/
+composition/.hyperframes/
+production/__pycache__/
+composition/assets/desktop/record.log
+composition/assets/blender/*-frames/
+production/runlogs/
+thermal-incident-*.json
+final-metadata.json
+check.json
+brag-render.mp4
+composition/.thumbnails/
+composition/.transcode-cache/
+composition/build_scene.py
+composition/assets/blender/*.png
+composition/assets/blender/*.mp4
+asset-metadata.json
+proof/

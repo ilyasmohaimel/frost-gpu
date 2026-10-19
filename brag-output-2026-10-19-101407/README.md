@@ -4,6 +4,7 @@ A 24-second remake with a matched G513QY model, an illustrated vapor chamber wit
 
 - `brag.mp4`: final 1080p, 60 fps video.
 - `brag.jpg`: selected poster, also baked into the first video frame.
+- `preview.webp`: silent, looping preview shown at the top of the repository README.
 - `composition/`: editable Hyperframes project.
 - `production/`: original Blender scene builder and reference-tracing geometry.
 - `CREDITS.md`: picture, music and font provenance.

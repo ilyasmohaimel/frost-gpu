@@ -1,6 +1,10 @@
 <p align="center">
-  <img src="assets/hero.svg" alt="Frost GPU. Keep the desktop. Change the GPU." width="100%">
+  <a href="https://github.com/ilyasmohaimel/frost-gpu/blob/main/brag-output-2026-10-19-101407/brag.mp4">
+    <img src="brag-output-2026-10-19-101407/preview.webp" alt="Frost GPU film: the G513QY model, a GPU cutaway and the same desktop switching renderers. Click for the full video with sound." width="100%">
+  </a>
 </p>
+
+<p align="center"><a href="brag-output-2026-10-19-101407/brag.mp4">Watch the full video with sound</a></p>
 
 <p align="center">
   <a href="docs/how-it-works.md">How it works</a> ·
@@ -66,8 +70,6 @@ stayed alive. USB-C PD was then tested with the same iGPU and D3cold result.
 [What was actually verified](docs/validation.md)
 
 ## A short tour
-
-[![Watch the 24-second Frost GPU film.](brag-output-2026-10-19-101407/brag.jpg)](https://github.com/ilyasmohaimel/frost-gpu/blob/main/brag-output-2026-10-19-101407/brag.mp4)
 
 [Watch or download the MP4](brag-output-2026-10-19-101407/brag.mp4).
 A custom G513QY model, an illustrated hardware cutaway, a real Brave screen

@@ -34,12 +34,12 @@ class ControllerTests(unittest.TestCase):
                 self.assertIsNone(session_stop_reason({**env,'FROST_GPU_LIVE_SESSION':'0'}))
                 file.unlink()
 
-    def test_battery_moves_contexts_before_compositor(self):
+    def test_battery_updates_renderer_before_rebuilding_contexts(self):
         b=FakeBackend();r=Reconciler(b).reconcile(False)
-        self.assertEqual(r['state'],'steady');self.assertEqual(b.calls,[('move',RX,IGPU),('switch',IGPU)])
+        self.assertEqual(r['state'],'steady');self.assertEqual(b.calls,[('switch',IGPU),('move',RX,IGPU)])
     def test_ac_moves_apps_that_started_on_igpu(self):
         b=FakeBackend(primary=IGPU,device=IGPU);r=Reconciler(b).reconcile(True)
-        self.assertEqual(r['state'],'steady');self.assertEqual(b.calls,[('move',IGPU,RX),('switch',RX)])
+        self.assertEqual(r['state'],'steady');self.assertEqual(b.calls,[('switch',RX),('move',IGPU,RX)])
     def test_unsupported_context_never_touches_compositor(self):
         b=FakeBackend(migratable=False);r=Reconciler(b).reconcile(False)
         self.assertEqual(r['state'],'blocked');self.assertEqual(b.calls,[])
@@ -48,14 +48,29 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(r['state'],'blocked');self.assertEqual(b.calls,[])
     def test_capture_refusal_preserves_apps_and_retries_renderer(self):
         b=FakeBackend();b.reject=True;c=Reconciler(b)
-        self.assertEqual(c.reconcile(False)['state'],'blocked');self.assertEqual(b.device,IGPU);self.assertEqual(b.renderer,RX)
+        self.assertEqual(c.reconcile(False)['state'],'blocked');self.assertEqual(b.device,RX);self.assertEqual(b.renderer,RX)
         b.reject=False;self.assertEqual(c.reconcile(False)['state'],'steady')
-        self.assertEqual(b.calls,[('move',RX,IGPU),('switch',IGPU),('switch',IGPU)])
+        self.assertEqual(b.calls,[('switch',IGPU),('switch',IGPU),('move',RX,IGPU)])
     def test_power_reversal_skips_stale_renderer_switch(self):
         b=FakeBackend();c=Reconciler(b);r=c.reconcile(False,power=lambda:True)
         self.assertEqual(r['state'],'power-changed');self.assertEqual(b.renderer,RX)
         self.assertEqual(c.reconcile(True)['state'],'steady')
-        self.assertEqual(b.calls,[('move',RX,IGPU),('move',IGPU,RX)])
+        self.assertEqual(b.calls,[])
+    def test_power_reversal_during_renderer_switch_restores_it_before_apps_move(self):
+        b=FakeBackend();values=iter((False,True))
+        r=Reconciler(b).reconcile(False,power=lambda:next(values))
+        self.assertEqual(r['state'],'power-changed');self.assertEqual(b.device,RX)
+        self.assertEqual(b.renderer,RX);self.assertEqual(b.calls,[('switch',IGPU),('switch',RX)])
+
+    def test_power_reversal_after_move_keeps_the_verified_pair_until_next_reconcile(self):
+        b=FakeBackend();desired=[False];original=b.move
+        def move(source,target):
+            answer=original(source,target);desired[0]=True;return answer
+        b.move=move;c=Reconciler(b);r=c.reconcile(False,power=lambda:desired[0])
+        self.assertEqual(r['state'],'power-changed');self.assertEqual(b.renderer,IGPU);self.assertEqual(b.device,IGPU)
+        self.assertEqual(c.reconcile(True)['state'],'steady')
+        self.assertEqual(b.renderer,RX);self.assertEqual(b.device,RX)
+
     def test_uncertain_mutation_halts_all_automatic_retries(self):
         b=FakeBackend();b.uncertain=True;c=Reconciler(b)
         self.assertEqual(c.reconcile(False)['state'],'halted');before=copy.copy(b.calls)

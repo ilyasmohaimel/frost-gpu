@@ -103,23 +103,40 @@ class Reconciler:
             report['sourceContexts']=sum(r.get('devices',0) for r in contexts)
             blockers=[r for r in contexts if r.get('class')!='migratable' or r.get('parked',0)>0 or r.get('render_only_version')!=1]
             if blockers:return {**report,'state':'blocked','error':'A registered context cannot migrate','blockers':blockers}
-            if contexts:
-                moved,error=self.backend.move(source,target)
-                if not moved:return {**report,'state':'blocked','error':error}
+            # KWin must advertise the destination before migration recreates
+            # WSI buffers. Otherwise those new buffers inherit the old sampling
+            # device and can wake it after the renderer has already moved.
+            def restore_renderer():
+                if primary != target:
+                    restored,error=self.backend.switch(primary)
+                    if not restored or self.backend.primary()!=primary:
+                        raise UncertainOperation('Renderer rollback failed after cancelled application migration: '+error)
+                report['compositor']=primary
+
             if power is not None and power()!=ac:
-                return {**report,'state':'power-changed','error':'Power source changed during application migration'}
+                return {**report,'state':'power-changed','error':'GPU selection changed before switching'}
             if primary!=target:
                 switched,error=self.backend.switch(target)
-                if not switched:return {**report,'state':'blocked','error':error,'appsOnTarget':True}
+                if not switched:return {**report,'state':'blocked','error':error,'appsOnTarget':not bool(contexts)}
             report['compositor']=self.backend.primary()
             if report['compositor']!=target:raise UncertainOperation('KWin renderer verification failed')
+            if power is not None and power()!=ac:
+                restore_renderer()
+                return {**report,'state':'power-changed','error':'GPU selection changed before application migration'}
+            if contexts:
+                moved,error=self.backend.move(source,target)
+                if not moved:
+                    restore_renderer()
+                    return {**report,'state':'blocked','error':error}
+            if power is not None and power()!=ac:
+                return {**report,'state':'power-changed','error':'GPU selection changed during application migration'}
             remaining=[r for r in self.backend.status() if r.get('type')=='client' and r.get('registered') is True and r.get('gpu')==source and (r.get('devices',0)>0 or r.get('parked',0)>0)]
             if remaining:return {**report,'state':'retry','error':'A new source context appeared during switching'}
             return {**report,'state':'steady','sourceContexts':0}
         except UncertainOperation as error:
             self.halted=str(error)
             return {**report,'state':'halted','error':self.halted}
-        except (RuntimeError,OSError,subprocess.TimeoutExpired) as error:
+        except (RuntimeError,OSError,ValueError,subprocess.TimeoutExpired) as error:
             return {**report,'state':'unavailable','error':str(error)}
 
 def ac_online():

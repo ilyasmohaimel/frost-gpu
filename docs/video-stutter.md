@@ -37,7 +37,35 @@ Xwayland keeps its existing stable device policy. Legacy clients and existing
 The ordinary nonexperimental path keeps its previous feedback behavior.
 
 This is separate from the earlier fix that kept KWin's explicit synchronization
-manager on the panel GPU. Both changes are needed for the tested setup.
+manager on the panel GPU.
+
+## Follow-up after reboot: buffer creation order
+
+The first feedback fix loaded after reboot, but normal desktop activity could
+still trigger RX wakeups after selecting iGPU or Eco. The controller moved
+application contexts before switching KWin. Migration recreated their WSI
+buffers while KWin still advertised the old device. Updating feedback afterward
+did not correct those buffers' existing import metadata.
+
+The controller now checks context support and the selected target, switches
+and verifies KWin, then moves the applications. Capture or lock refusal leaves
+apps untouched. A known failed application move triggers a renderer rollback;
+an uncertain result or failed rollback halts retries. Target changes are
+checked around both stages.
+
+The comparison used an isolated Plasma desktop with clock seconds enabled to
+force redraws. With the app-first order, its KWin recorded about 11.8 ms of RX
+graphics-engine activity over an eight-second sample after moving to iGPU.
+With renderer-first ordering, RX graphics and compute deltas were zero in the
+same sample. Both runs kept Plasma and the test window visible through the
+round trip. This measures routing activity, not frame latency or battery life.
+
+On the real desktop, the preceding order produced an additional KWin-triggered
+RX resume after returning to Eco. With the updated controller, the RX woke for
+the requested RX mode, then suspended after returning to Eco without another
+resume during the 60-second trace. The user confirmed smooth Codex and desktop
+use afterward. The controller was replaced and restarted without logging out
+or restarting applications. Its next fresh-boot run remains a separate check.
 
 ## What was verified
 
@@ -49,10 +77,9 @@ manager on the panel GPU. Both changes are needed for the tested setup.
 | Live workaround | Restarting only Plasma cleared its stale route; the same video then played smoothly, confirmed by the user |
 | Live power check | With Eco and barrel power, all 100 samples over about 30 seconds showed RX in D3cold and KWin steady on iGPU |
 
-The updated KWin library was built and installed in the private prefix with a
-backup. The current session kept its already mapped library. A login using
-the updated library remains a separate smoke test; the nested tests do not
-replace that check.
+The KWin library was built and installed in the private prefix with a backup,
+then verified loaded after reboot. That reboot exposed the additional controller
+ordering issue described above. Both fixes are required for the tested result.
 
 These observations establish this wakeup loop. They do not establish the cause
 of every video pause or the earlier intermittent pointer-only stutter.

@@ -37,22 +37,29 @@ backend, rebuilds on the target, and attempts to restore the old renderer if
 the new one fails. It refuses while locked or while a screencast source exists.
 The rollback is an attempt, not a promise of crash-free recovery.
 
-The controller first checks registered contexts, then moves supported apps,
-checks whether power changed during the move, switches KWin, and verifies the
-result. A lost mutation reply halts automatic retries. A blocked compositor
-can leave apps on the target while KWin remains on the source; the tray reports
-that condition instead of claiming the whole transition finished.
+The controller checks registered contexts and the current target, then switches
+KWin and verifies its renderer before moving supported apps. KWin must advertise
+the destination before migration rebuilds application buffers. Rebuilding them
+under the old device feedback can leave KWin copying content through the RX
+after the app has moved to iGPU.
+
+A capture or lock refusal leaves apps untouched. If a confirmed application
+move fails and rolls back, the controller also attempts to restore the previous
+renderer. A failed renderer rollback or lost mutation reply halts automatic
+retries. Selection changes are checked before and after each stage; a change
+after successful application migration is handled on the next reconciliation.
 
 ```mermaid
 flowchart LR
   A[Power source changes] --> B{Registered contexts supported?}
   B -->|No| C[Report blocked]
-  B -->|Yes| D[Move application state]
-  D --> E{Power still agrees?}
-  E -->|No| F[Re-evaluate target]
-  E -->|Yes| G[Request KWin renderer]
-  G --> H[Verify renderer and contexts]
-  H --> I[Observe runtime power separately]
+  B -->|Yes| D[Switch and verify KWin renderer]
+  D --> E{Selection still current?}
+  E -->|No| F[Restore renderer or halt on uncertainty]
+  E -->|Yes| G[Rebuild application state on target]
+  G --> H{Migration confirmed?}
+  H -->|No| F
+  H -->|Yes| I[Verify contexts and observe runtime power]
 ```
 
 ## The synchronization trap

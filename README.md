@@ -66,6 +66,11 @@ desktop to iGPU and the RX reached **`suspended` + `D3cold`**. Plugging back in
 woke the RX and restored its renderer. The monitored application processes
 stayed alive. USB-C PD was then tested with the same iGPU and D3cold result.
 
+An October 22 follow-up fixed a separate Plasma buffer-routing loop. KWin
+stayed on the iGPU, but stale DMA-BUF feedback sent updated Plasma content
+through the RX and repeatedly woke it. The patch now updates that feedback
+when the renderer changes. [Diagnosis, tests and activation notes.](docs/video-stutter.md)
+
 [The mechanism and tradeoffs](docs/how-it-works.md) ·
 [What was actually verified](docs/validation.md)
 

@@ -257,7 +257,7 @@ index f455408..2fd54d1 100644
  
  ScreenCastSource::~ScreenCastSource()
 diff --git a/src/wayland/linuxdmabufv1clientbuffer.cpp b/src/wayland/linuxdmabufv1clientbuffer.cpp
-index 1b0c88c..a4c0527 100644
+index 1b0c88c..426e489 100644
 --- a/src/wayland/linuxdmabufv1clientbuffer.cpp
 +++ b/src/wayland/linuxdmabufv1clientbuffer.cpp
 @@ -15,14 +15,18 @@
@@ -304,3 +304,64 @@ index 1b0c88c..a4c0527 100644
          QObject::connect(ClientConnection::get(resource->client()), &ClientConnection::destroyed, q, [this, c = resource->client()]() {
              mainDevices.remove(c);
          });
+@@ -391,18 +411,31 @@ void LinuxDmaBufV1ClientBufferIntegration::setSupportedFormatsWithModifiers(cons
+         d->table = std::make_unique<LinuxDmaBufV1FormatTable>(allFormats);
+         d->defaultTranches = tranches;
+ 
+-        // If a GPU was hotunplugged, we have no choice but to
+-        // switch clients to a different device.
++        // Feedback-capable clients must follow an explicit renderer switch.
++        // Otherwise new buffers retain the old sampling device and KWin copies
++        // them through the sleeping GPU even after the client has migrated.
++        // Keep legacy clients and Xwayland on their original device; existing
++        // wl_buffers also retain their import device and ordinary copy fallback.
++        const bool followRenderer = environmentVariableBoolValue("KWIN_ENABLE_EXPERIMENTAL_GPU_SWITCH").value_or(false);
++        const auto resources = d->resourceMap();
+         for (auto [client, device] : d->mainDevices.asKeyValueRange()) {
+             const bool deviceRemoved = std::ranges::none_of(tranches, [device](const auto &tranche) {
+                 return tranche.device == device;
+             });
+-            if (deviceRemoved) {
+-                device = tranches[0].device;
++            const bool hasFeedback = std::ranges::any_of(resources.values(client), [](const auto resource) {
++                return resource->version() >= ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK_SINCE_VERSION;
++            });
++            const bool isXwayland = waylandServer() && ClientConnection::get(client) == waylandServer()->xWaylandConnection();
++            if (deviceRemoved || (followRenderer && hasFeedback && !isXwayland)) {
++                device = d->currentMainDevice;
+             }
+         }
+ 
+-        d->defaultFeedback->sendTranches();
++        if (followRenderer) {
++            Q_EMIT supportedFormatsChanged();
++        } else {
++            d->defaultFeedback->sendTranches();
++        }
+     }
+ }
+ 
+@@ -491,6 +524,9 @@ LinuxDmaBufV1ClientBuffer *LinuxDmaBufV1ClientBuffer::get(wl_resource *resource)
+ LinuxDmaBufV1Feedback::LinuxDmaBufV1Feedback(LinuxDmaBufV1ClientBufferIntegrationPrivate *integration, wl_client *client)
+     : d(new LinuxDmaBufV1FeedbackPrivate(integration, client))
+ {
++    // Both default and per-surface feedback need the updated main device.
++    connect(integration->q, &LinuxDmaBufV1ClientBufferIntegration::supportedFormatsChanged,
++            this, &LinuxDmaBufV1Feedback::sendTranches);
+ }
+ 
+ LinuxDmaBufV1Feedback::~LinuxDmaBufV1Feedback() = default;
+diff --git a/src/wayland/linuxdmabufv1clientbuffer.h b/src/wayland/linuxdmabufv1clientbuffer.h
+index a2b630b..cdbd55c 100644
+--- a/src/wayland/linuxdmabufv1clientbuffer.h
++++ b/src/wayland/linuxdmabufv1clientbuffer.h
+@@ -80,6 +80,9 @@ public:
+ 
+     std::optional<dev_t> mainDevice(wl_client *client) const;
+ 
++Q_SIGNALS:
++    void supportedFormatsChanged();
++
+ private:
+     friend class LinuxDmaBufV1ClientBufferIntegrationPrivate;
+     std::unique_ptr<LinuxDmaBufV1ClientBufferIntegrationPrivate> d;

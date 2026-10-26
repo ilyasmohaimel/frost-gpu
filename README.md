@@ -165,6 +165,12 @@ brag-output/         Short video, poster, storyboard, and editable composition
 brag-output-2026-10-19-101407/  Latest film, matched model source, and real captures
 ```
 
+## Power tuning companion
+
+[Frost Power](https://github.com/ilyasmohaimel/frost-power) documents the same G513QY's CPU/RX efficiency work, measured 38 W Balanced and 20 W Eco presets, owned-setting rollback, and Caelestia Battery controls. It includes the controller source, portable tests, measurements and a short film using the laptop model.
+
+Its Hyprland GPU preference applies at the next login. This repository's experimental live KDE migration remains a separate mechanism. The [desktop configuration](https://github.com/ilyasmohaimel/dotfiles-linux) and [private recovery repository](https://github.com/ilyasmohaimel/linux-setup-recovery) cover the surrounding setup; recovery access is required.
+
 ## Credits and license
 
 [KDE KWin](https://invent.kde.org/plasma/kwin) provides the compositor.
